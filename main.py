@@ -2,6 +2,8 @@ import html
 import platform
 import subprocess
 import sys
+import time
+from collections import deque
 from typing import Optional
 
 from PyQt6.QtCore import QPoint, QThread, QTimer, Qt, pyqtSignal
@@ -31,6 +33,7 @@ class GoldWidget(QWidget):
         self._fetcher = None  # type: Optional[PriceFetcher]
         self._settings_dialog = None  # type: Optional[SettingsDialog]
         self._logs_dialog = None  # type: Optional[LogsDialog]
+        self._price_history = deque(maxlen=1000)  # (timestamp, price)
 
         self._init_ui()
         self._init_tray()
@@ -46,17 +49,17 @@ class GoldWidget(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow, True)
-        self.setFixedSize(200, 120)
+        self.setFixedSize(200, 135)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 10)
         layout.setSpacing(1)
 
-        title = QLabel("Au(T+D)")
-        title.setFont(QFont("PingFang SC", 10))
-        title.setStyleSheet("color: rgba(255,255,255,0.5);")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
+        self.title_label = QLabel("Au(T+D)")
+        self.title_label.setFont(QFont("PingFang SC", 10))
+        self.title_label.setStyleSheet("color: rgba(255,255,255,0.5);")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.title_label)
 
         self.price_label = QLabel("--")
         self.price_label.setFont(QFont("Menlo", 26, QFont.Weight.Bold))
@@ -64,11 +67,19 @@ class GoldWidget(QWidget):
         self.price_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.price_label)
 
-        self.change_label = QLabel("")
-        self.change_label.setFont(QFont("Menlo", 11))
-        self.change_label.setStyleSheet("color: rgba(255,255,255,0.5);")
-        self.change_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.change_label)
+        # 日涨跌
+        self.daily_label = QLabel("")
+        self.daily_label.setFont(QFont("Menlo", 10))
+        self.daily_label.setStyleSheet("color: rgba(255,255,255,0.5);")
+        self.daily_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.daily_label)
+
+        # 区间涨跌
+        self.interval_label = QLabel("")
+        self.interval_label.setFont(QFont("Menlo", 10))
+        self.interval_label.setStyleSheet("color: rgba(255,255,255,0.5);")
+        self.interval_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.interval_label)
 
         self.range_label = QLabel("")
         self.range_label.setFont(QFont("PingFang SC", 9))
@@ -153,38 +164,83 @@ class GoldWidget(QWidget):
 
         data = result["data"]
         price = data["price"]
-        change = data["change"]
-        change_pct = data["change_pct"]
+        source = data.get("source", "cmb")
         self.last_price = price
+        now = time.time()
+        self._price_history.append((now, price))
+
+        # 标题：区分数据源
+        if source == "intl":
+            self.title_label.setText("XAU 国际金价")
+        else:
+            self.title_label.setText("Au(T+D)")
 
         self.price_label.setText(f"¥{price:.2f}")
 
-        sign = "+" if change >= 0 else ""
-        arrow = "▲" if change >= 0 else "▼"
-        self.change_label.setText(f"{arrow} {sign}{change_pct:.2f}%")
+        # 日涨跌（对比昨收）— 国际源无日涨跌数据
+        if source == "cmb":
+            change = data["change"]
+            change_pct = data["change_pct"]
+            sign = "+" if change >= 0 else ""
+            arrow = "▲" if change >= 0 else "▼"
+            self.daily_label.setText(f"日 {arrow}{sign}{change_pct:.2f}%")
 
-        threshold = self.cfg["color_threshold"]
-        if change_pct >= threshold:
-            color = "#ff4444"
-        elif change_pct <= -threshold:
-            color = "#44ff44"
+            daily_threshold = self.cfg["color_threshold"]
+            if change_pct >= daily_threshold:
+                daily_color = "#ff4444"
+            elif change_pct <= -daily_threshold:
+                daily_color = "#44ff44"
+            else:
+                daily_color = "rgba(255,255,255,0.5)"
+            self.daily_label.setStyleSheet(f"color: {daily_color};")
         else:
-            color = "white"
+            self.daily_label.setText("日 --")
+            self.daily_label.setStyleSheet("color: rgba(255,255,255,0.3);")
 
-        self.price_label.setStyleSheet(f"color: {color};")
-        if color == "white":
-            self.change_label.setStyleSheet("color: rgba(255,255,255,0.5);")
+        # 区间涨跌（对比 N 分钟前）
+        interval_min = self.cfg.get("interval_minutes", 5)
+        cutoff = now - interval_min * 60
+        ref_price = None
+        for ts, p in self._price_history:
+            if ts <= cutoff:
+                ref_price = p
+            else:
+                break
+
+        if ref_price is not None and ref_price > 0:
+            iv_pct = (price - ref_price) / ref_price * 100
+            iv_sign = "+" if iv_pct >= 0 else ""
+            iv_arrow = "▲" if iv_pct >= 0 else "▼"
+            self.interval_label.setText(f"{interval_min}min {iv_arrow}{iv_sign}{iv_pct:.2f}%")
+
+            threshold = self.cfg["color_threshold"]
+            if iv_pct >= threshold:
+                iv_color = "#ff4444"
+            elif iv_pct <= -threshold:
+                iv_color = "#44ff44"
+            else:
+                iv_color = "white"
+
+            # 价格主色由区间涨跌驱动
+            self.price_label.setStyleSheet(f"color: {iv_color};")
+            if iv_color == "white":
+                self.interval_label.setStyleSheet("color: rgba(255,255,255,0.5);")
+            else:
+                self.interval_label.setStyleSheet(f"color: {iv_color};")
         else:
-            self.change_label.setStyleSheet(f"color: {color};")
+            self.interval_label.setText(f"{interval_min}min --")
+            self.interval_label.setStyleSheet("color: rgba(255,255,255,0.5);")
+            self.price_label.setStyleSheet("color: white;")
 
-        self.range_label.setText(f"低 {data['low']:.2f}  高 {data['high']:.2f}")
+        # 高低区间（国际源无此数据）
+        if source == "cmb" and data["high"] > 0:
+            self.range_label.setText(f"低 {data['low']:.2f}  高 {data['high']:.2f}")
+        else:
+            self.range_label.setText("")
         append_log(
             "INFO",
             "fetch_success",
-            (
-                f"抓取成功 price={price:.2f} change_pct={data['change_pct']:.2f}% "
-                f"high={data['high']:.2f} low={data['low']:.2f} source_time={data['time']}"
-            ),
+            f"抓取成功 source={source} price={price:.2f}",
         )
         self._check_notify(price)
 

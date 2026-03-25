@@ -4,9 +4,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QApplication,
-    QDialog,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -14,15 +13,19 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from glass import GlassDialog
+
 LOG_PATH = os.path.join(os.path.dirname(__file__), "goldmonitor.log.jsonl")
 RETENTION = timedelta(hours=1)
 
 
-def _now() -> datetime:
+def _now():
+    # type: () -> datetime
     return datetime.now().astimezone()
 
 
-def _parse_ts(raw: Optional[str]) -> Optional[datetime]:
+def _parse_ts(raw):
+    # type: (Optional[str]) -> Optional[datetime]
     if not raw:
         return None
     try:
@@ -31,7 +34,8 @@ def _parse_ts(raw: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _prune_entries(entries: List[Dict]) -> List[Dict]:
+def _prune_entries(entries):
+    # type: (List[Dict]) -> List[Dict]
     cutoff = _now() - RETENTION
     kept = []
     for entry in entries:
@@ -43,10 +47,10 @@ def _prune_entries(entries: List[Dict]) -> List[Dict]:
     return kept
 
 
-def _read_entries() -> List[Dict]:
+def _read_entries():
+    # type: () -> List[Dict]
     if not os.path.exists(LOG_PATH):
         return []
-
     entries = []
     try:
         with open(LOG_PATH, "r", encoding="utf-8") as f:
@@ -55,17 +59,16 @@ def _read_entries() -> List[Dict]:
                 if not line:
                     continue
                 try:
-                    entry = json.loads(line)
+                    entries.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-                entries.append(entry)
     except OSError:
         return []
-
     return entries
 
 
-def _write_entries(entries: List[Dict]) -> None:
+def _write_entries(entries):
+    # type: (List[Dict]) -> None
     try:
         with open(LOG_PATH, "w", encoding="utf-8") as f:
             for entry in entries:
@@ -75,7 +78,8 @@ def _write_entries(entries: List[Dict]) -> None:
         pass
 
 
-def load_recent_logs() -> List[Dict]:
+def load_recent_logs():
+    # type: () -> List[Dict]
     entries = _read_entries()
     pruned = _prune_entries(entries)
     if os.path.exists(LOG_PATH) and len(pruned) != len(entries):
@@ -83,7 +87,8 @@ def load_recent_logs() -> List[Dict]:
     return pruned
 
 
-def append_log(level: str, event: str, message: str) -> None:
+def append_log(level, event, message):
+    # type: (str, str, str) -> None
     entry = {
         "ts": _now().isoformat(timespec="seconds"),
         "level": level.upper(),
@@ -95,10 +100,10 @@ def append_log(level: str, event: str, message: str) -> None:
     _write_entries(entries)
 
 
-def format_logs(entries: List[Dict]) -> str:
+def format_logs(entries):
+    # type: (List[Dict]) -> str
     if not entries:
         return "最近 1 小时内暂无日志。"
-
     lines = []
     for entry in entries:
         ts = _parse_ts(entry.get("ts"))
@@ -110,77 +115,45 @@ def format_logs(entries: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-class LogsDialog(QDialog):
+class LogsDialog(GlassDialog):
     def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("GoldMonitor - 日志")
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.Tool)
-        self.resize(640, 420)
-
-        screen = QApplication.primaryScreen()
-        if screen:
-            geo = screen.availableGeometry()
-            self.move(
-                geo.x() + (geo.width() - self.width()) // 2,
-                geo.y() + (geo.height() - self.height()) // 2,
-            )
-
-        self.setStyleSheet(
-            """
-            QDialog {
-                background: #202020;
-                color: #e0e0e0;
-            }
-            QLabel {
-                color: #cfcfcf;
-                font-size: 12px;
-            }
-            QPlainTextEdit {
-                background: #111111;
-                color: #d8d8d8;
-                border: 1px solid #444;
-                border-radius: 6px;
-                padding: 10px;
-                font-family: Consolas, Menlo, monospace;
-                font-size: 12px;
-            }
-            QPushButton {
-                background: #4a9eff;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 8px 18px;
-                font-size: 12px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background: #3a8eef;
-            }
-            """
-        )
+        super().__init__(parent, width=580, height=400)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(24, 20, 24, 18)
+        layout.setSpacing(10)
 
-        layout.addWidget(QLabel("仅显示最近 1 小时内的运行日志"))
+        # 标题
+        title = QLabel("运行日志")
+        title.setFont(QFont("PingFang SC", 16, QFont.Weight.Bold))
+        title.setStyleSheet("color: white; background: transparent;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        hint = QLabel("仅保留最近 1 小时")
+        hint.setStyleSheet("color: rgba(255,255,255,0.3); font-size: 11px; background: transparent;")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(hint)
 
         self.editor = QPlainTextEdit(self)
         self.editor.setReadOnly(True)
         self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         layout.addWidget(self.editor)
 
-        button_row = QHBoxLayout()
-        button_row.addStretch()
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.addStretch()
 
         btn_refresh = QPushButton("刷新")
         btn_refresh.clicked.connect(self.refresh_logs)
-        button_row.addWidget(btn_refresh)
+        btn_row.addWidget(btn_refresh)
 
         btn_close = QPushButton("关闭")
+        btn_close.setObjectName("closeBtn")
         btn_close.clicked.connect(self.close)
-        button_row.addWidget(btn_close)
-        layout.addLayout(button_row)
+        btn_row.addWidget(btn_close)
+
+        layout.addLayout(btn_row)
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh_logs)
@@ -188,19 +161,15 @@ class LogsDialog(QDialog):
 
         self.refresh_logs()
 
-    def refresh_logs(self) -> None:
+    def refresh_logs(self):
         vbar = self.editor.verticalScrollBar()
-        hbar = self.editor.horizontalScrollBar()
         prev_v = vbar.value()
-        prev_h = hbar.value()
         was_at_bottom = prev_v >= max(0, vbar.maximum() - 4)
 
         self.editor.setPlainText(format_logs(load_recent_logs()))
 
         vbar = self.editor.verticalScrollBar()
-        hbar = self.editor.horizontalScrollBar()
         if was_at_bottom:
             vbar.setValue(vbar.maximum())
         else:
             vbar.setValue(min(prev_v, vbar.maximum()))
-        hbar.setValue(min(prev_h, hbar.maximum()))
