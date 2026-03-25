@@ -1,6 +1,10 @@
+import os
+
 from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtGui import QColor, QPainter, QPainterPath
 from PyQt6.QtWidgets import QApplication, QDialog
+
+_DIR = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
 
 
 class GlassDialog(QDialog):
@@ -32,24 +36,56 @@ class GlassDialog(QDialog):
         self.setStyleSheet(self._build_stylesheet())
 
     def _build_stylesheet(self):
-        return """
-            QLabel {
+        arrow_up = f"{_DIR}/arrow_up.svg"
+        arrow_dn = f"{_DIR}/arrow_down.svg"
+        return f"""
+            QLabel {{
                 color: rgba(255,255,255,0.7);
                 font-size: 13px;
                 background: transparent;
-            }
-            QSpinBox, QDoubleSpinBox {
+            }}
+            QSpinBox, QDoubleSpinBox {{
                 background: rgba(255,255,255,0.08);
                 color: #e0e0e0;
                 border: 1px solid rgba(255,255,255,0.15);
                 border-radius: 6px;
-                padding: 5px;
+                padding: 4px 18px 4px 6px;
                 font-size: 13px;
-            }
-            QSpinBox:focus, QDoubleSpinBox:focus {
+            }}
+            QSpinBox:focus, QDoubleSpinBox:focus {{
                 border: 1px solid rgba(74,158,255,0.6);
-            }
-            QPlainTextEdit {
+            }}
+            QSpinBox::up-button, QDoubleSpinBox::up-button {{
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 18px;
+                border-top-right-radius: 5px;
+                border-left: 1px solid rgba(255,255,255,0.1);
+                background: rgba(255,255,255,0.05);
+            }}
+            QSpinBox::down-button, QDoubleSpinBox::down-button {{
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+                width: 18px;
+                border-bottom-right-radius: 5px;
+                border-left: 1px solid rgba(255,255,255,0.1);
+                background: rgba(255,255,255,0.05);
+            }}
+            QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+            QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+                background: rgba(255,255,255,0.15);
+            }}
+            QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+                image: url({arrow_up});
+                width: 7px;
+                height: 7px;
+            }}
+            QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+                image: url({arrow_dn});
+                width: 7px;
+                height: 7px;
+            }}
+            QPlainTextEdit {{
                 background: rgba(0,0,0,0.3);
                 color: rgba(255,255,255,0.8);
                 border: 1px solid rgba(255,255,255,0.1);
@@ -58,8 +94,8 @@ class GlassDialog(QDialog):
                 font-family: Menlo, Consolas, monospace;
                 font-size: 12px;
                 selection-background-color: rgba(74,158,255,0.3);
-            }
-            QPushButton {
+            }}
+            QPushButton {{
                 background: rgba(74,158,255,0.8);
                 color: white;
                 border: none;
@@ -67,19 +103,19 @@ class GlassDialog(QDialog):
                 padding: 8px 24px;
                 font-size: 13px;
                 font-weight: bold;
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background: rgba(74,158,255,1.0);
-            }
-            QPushButton:pressed {
+            }}
+            QPushButton:pressed {{
                 background: rgba(50,130,230,1.0);
-            }
-            QPushButton#closeBtn {
+            }}
+            QPushButton#closeBtn {{
                 background: rgba(255,255,255,0.1);
-            }
-            QPushButton#closeBtn:hover {
+            }}
+            QPushButton#closeBtn:hover {{
                 background: rgba(255,255,255,0.2);
-            }
+            }}
         """
 
     def paintEvent(self, event):
@@ -107,7 +143,12 @@ class GlassDialog(QDialog):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            # Only start drag if clicking on the dialog background, not on child widgets
+            child = self.childAt(event.position().toPoint())
+            if child is None:
+                self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            else:
+                super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
