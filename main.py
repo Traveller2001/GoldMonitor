@@ -185,10 +185,10 @@ class GoldWidget(QWidget):
             arrow = "▲" if change >= 0 else "▼"
             self.daily_label.setText(f"日 {arrow}{sign}{change_pct:.2f}%")
 
-            daily_threshold = self.cfg["color_threshold"]
-            if change_pct >= daily_threshold:
+            # 日涨跌颜色：涨即红、跌即绿
+            if change_pct > 0:
                 daily_color = "#ff4444"
-            elif change_pct <= -daily_threshold:
+            elif change_pct < 0:
                 daily_color = "#44ff44"
             else:
                 daily_color = "rgba(255,255,255,0.5)"
