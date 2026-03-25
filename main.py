@@ -34,6 +34,7 @@ class GoldWidget(QWidget):
         self.notified_low = False
         self._drag_pos = None  # type: Optional[QPoint]
         self._fetcher = None  # type: Optional[PriceFetcher]
+        self._settings_dialog = None  # type: Optional[SettingsDialog]
 
         self._init_ui()
         self._init_tray()
@@ -113,7 +114,7 @@ class GoldWidget(QWidget):
         menu.addSeparator()
 
         action_settings = QAction("设置", self)
-        action_settings.triggered.connect(self._open_settings)
+        action_settings.triggered.connect(self._schedule_open_settings)
         menu.addAction(action_settings)
 
         action_refresh = QAction("刷新", self)
@@ -238,10 +239,28 @@ class GoldWidget(QWidget):
         self.raise_()
         self.activateWindow()
 
+    def _schedule_open_settings(self):
+        # Delay until the context menu fully closes; otherwise Windows can
+        # swallow the dialog activation and make "设置" appear unresponsive.
+        QTimer.singleShot(0, self._open_settings)
+
     def _open_settings(self):
-        dlg = SettingsDialog(self)
+        if self._settings_dialog is not None:
+            self._settings_dialog.raise_()
+            self._settings_dialog.activateWindow()
+            return
+
+        dlg = SettingsDialog()
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
         dlg.settings_changed.connect(self._apply_settings)
-        dlg.exec()
+        dlg.finished.connect(self._on_settings_closed)
+        dlg.open()
+        dlg.raise_()
+        dlg.activateWindow()
+        self._settings_dialog = dlg
+
+    def _on_settings_closed(self, _result):
+        self._settings_dialog = None
 
     def _apply_settings(self, cfg):
         self.cfg = cfg
@@ -281,7 +300,7 @@ class GoldWidget(QWidget):
             QMenu::item:selected { background: #4a9eff; border-radius: 4px; }
         """)
         action_settings = QAction("设置", self)
-        action_settings.triggered.connect(self._open_settings)
+        action_settings.triggered.connect(self._schedule_open_settings)
         menu.addAction(action_settings)
 
         action_refresh = QAction("刷新", self)
