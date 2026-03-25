@@ -1,20 +1,15 @@
+import html
 import platform
 import subprocess
 import sys
 from typing import Optional
 
-from PyQt6.QtCore import QPoint, QTimer, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QPoint, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPainterPath, QPixmap
-from PyQt6.QtWidgets import (
-    QApplication,
-    QLabel,
-    QMenu,
-    QSystemTrayIcon,
-    QVBoxLayout,
-    QWidget,
-)
+from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget
 
-from api import fetch_gold_price
+from api import fetch_gold_price_result
+from logs import LogsDialog, append_log
 from settings import SettingsDialog, load_config
 
 
@@ -22,7 +17,7 @@ class PriceFetcher(QThread):
     price_fetched = pyqtSignal(object)
 
     def run(self):
-        self.price_fetched.emit(fetch_gold_price())
+        self.price_fetched.emit(fetch_gold_price_result())
 
 
 class GoldWidget(QWidget):
@@ -35,10 +30,12 @@ class GoldWidget(QWidget):
         self._drag_pos = None  # type: Optional[QPoint]
         self._fetcher = None  # type: Optional[PriceFetcher]
         self._settings_dialog = None  # type: Optional[SettingsDialog]
+        self._logs_dialog = None  # type: Optional[LogsDialog]
 
         self._init_ui()
         self._init_tray()
         self._init_timer()
+        append_log("INFO", "app_start", "程序启动")
         self._fetch_price()
 
     def _init_ui(self):
@@ -48,7 +45,6 @@ class GoldWidget(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        # macOS: 保持 Tool 窗口在应用失焦时仍然显示（非 Mac 自动忽略）
         self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow, True)
         self.setFixedSize(200, 120)
 
@@ -102,7 +98,7 @@ class GoldWidget(QWidget):
         painter.end()
         self.tray.setIcon(QIcon(pixmap))
 
-        menu = QMenu()
+        menu = QMenu(self)
         action_show = QAction("显示", self)
         action_show.triggered.connect(self._show_widget)
         menu.addAction(action_show)
@@ -113,6 +109,10 @@ class GoldWidget(QWidget):
 
         menu.addSeparator()
 
+        action_logs = QAction("日志", self)
+        action_logs.triggered.connect(self._schedule_open_logs)
+        menu.addAction(action_logs)
+
         action_settings = QAction("设置", self)
         action_settings.triggered.connect(self._schedule_open_settings)
         menu.addAction(action_settings)
@@ -122,10 +122,12 @@ class GoldWidget(QWidget):
         menu.addAction(action_refresh)
 
         menu.addSeparator()
+
         action_quit = QAction("退出", self)
         action_quit.triggered.connect(QApplication.quit)
         menu.addAction(action_quit)
 
+        self.tray_menu = menu
         self.tray.setContextMenu(menu)
         self.tray.show()
 
@@ -141,10 +143,15 @@ class GoldWidget(QWidget):
         self._fetcher.price_fetched.connect(self._on_price)
         self._fetcher.start()
 
-    def _on_price(self, data):
-        if data is None:
+    def _on_price(self, result):
+        if not isinstance(result, dict) or not result.get("ok"):
+            error = "unknown error"
+            if isinstance(result, dict):
+                error = result.get("error", error)
+            append_log("ERROR", "fetch_failed", f"抓取失败: {error}")
             return
 
+        data = result["data"]
         price = data["price"]
         prev = self.last_price
         self.last_price = price
@@ -177,8 +184,17 @@ class GoldWidget(QWidget):
             arrow = "▲" if change >= 0 else "▼"
             self.change_label.setText(f"{arrow} {sign}{change_pct:.2f}%")
             self.price_label.setStyleSheet("color: white;")
+            self.change_label.setStyleSheet("color: rgba(255,255,255,0.5);")
 
-        self.range_label.setText(f"低 {data['low']:.2f} — 高 {data['high']:.2f}")
+        self.range_label.setText(f"低 {data['low']:.2f}  高 {data['high']:.2f}")
+        append_log(
+            "INFO",
+            "fetch_success",
+            (
+                f"抓取成功 price={price:.2f} change_pct={data['change_pct']:.2f}% "
+                f"high={data['high']:.2f} low={data['low']:.2f} source_time={data['time']}"
+            ),
+        )
         self._check_notify(price)
 
     def _check_notify(self, price):
@@ -187,52 +203,72 @@ class GoldWidget(QWidget):
 
         if high > 0 and price >= high and not self.notified_high:
             self.notified_high = True
-            self._send_notification(
-                "金价突破高位",
-                f"¥{price:.2f}/g 已达到 ≥ ¥{high:.2f} 的阈值",
-            )
+            title = "金价突破高位"
+            body = f"¥{price:.2f}/g 已达到 >= ¥{high:.2f}"
+            if self._send_notification(title, body):
+                append_log("INFO", "notify_high", f"高价阈值触发 price={price:.2f} target={high:.2f}")
+            else:
+                append_log("WARN", "notify_high_failed", f"高价阈值触发但通知发送失败 price={price:.2f} target={high:.2f}")
         elif high > 0 and price < high:
             self.notified_high = False
 
         if low > 0 and price <= low and not self.notified_low:
             self.notified_low = True
-            self._send_notification(
-                "金价跌破低位",
-                f"¥{price:.2f}/g 已达到 ≤ ¥{low:.2f} 的阈值",
-            )
+            title = "金价跌破低位"
+            body = f"¥{price:.2f}/g 已达到 <= ¥{low:.2f}"
+            if self._send_notification(title, body):
+                append_log("INFO", "notify_low", f"低价阈值触发 price={price:.2f} target={low:.2f}")
+            else:
+                append_log("WARN", "notify_low_failed", f"低价阈值触发但通知发送失败 price={price:.2f} target={low:.2f}")
         elif low > 0 and price > low:
             self.notified_low = False
 
     def _send_notification(self, title, body):
         try:
             if platform.system() == "Darwin":
-                subprocess.run(
-                    ["osascript", "-e",
-                     f'display notification "{body}" with title "{title}" sound name "Glass"'],
-                    check=False, capture_output=True,
+                result = subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        f'display notification "{body}" with title "{title}" sound name "Glass"',
+                    ],
+                    check=False,
+                    capture_output=True,
                 )
-            elif platform.system() == "Linux":
-                subprocess.run(
+                return result.returncode == 0
+
+            if platform.system() == "Linux":
+                result = subprocess.run(
                     ["notify-send", title, body],
-                    check=False, capture_output=True,
+                    check=False,
+                    capture_output=True,
                 )
-            elif platform.system() == "Windows":
-                # Windows 10+ toast via PowerShell
+                return result.returncode == 0
+
+            if platform.system() == "Windows":
+                safe_title = html.escape(title, quote=True)
+                safe_body = html.escape(body, quote=True)
                 ps = (
-                    f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
-                    f"ContentType = WindowsRuntime] > $null; "
-                    f"$xml = [xml]\"<toast><visual><binding template='ToastGeneric'>"
-                    f"<text>{title}</text><text>{body}</text>"
-                    f"</binding></visual></toast>\"; "
-                    f"$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
-                    f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('GoldMonitor').Show($toast)"
+                    "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
+                    "ContentType = WindowsRuntime] > $null; "
+                    "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, "
+                    "ContentType = WindowsRuntime] > $null; "
+                    "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument; "
+                    f"$xml.LoadXml(\"<toast><visual><binding template='ToastGeneric'><text>{safe_title}</text>"
+                    f"<text>{safe_body}</text></binding></visual></toast>\"); "
+                    "$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
+                    "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('GoldMonitor').Show($toast)"
                 )
-                subprocess.run(
-                    ["powershell", "-Command", ps],
-                    check=False, capture_output=True,
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps],
+                    check=False,
+                    capture_output=True,
                 )
+                return result.returncode == 0
         except Exception:
-            pass
+            return False
+
+        return False
 
     def _show_widget(self):
         self.show()
@@ -240,9 +276,10 @@ class GoldWidget(QWidget):
         self.activateWindow()
 
     def _schedule_open_settings(self):
-        # Delay until the context menu fully closes; otherwise Windows can
-        # swallow the dialog activation and make "设置" appear unresponsive.
         QTimer.singleShot(0, self._open_settings)
+
+    def _schedule_open_logs(self):
+        QTimer.singleShot(0, self._open_logs)
 
     def _open_settings(self):
         if self._settings_dialog is not None:
@@ -259,14 +296,40 @@ class GoldWidget(QWidget):
         dlg.activateWindow()
         self._settings_dialog = dlg
 
+    def _open_logs(self):
+        if self._logs_dialog is not None:
+            self._logs_dialog.refresh_logs()
+            self._logs_dialog.raise_()
+            self._logs_dialog.activateWindow()
+            return
+
+        dlg = LogsDialog()
+        dlg.finished.connect(self._on_logs_closed)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        self._logs_dialog = dlg
+
     def _on_settings_closed(self, _result):
         self._settings_dialog = None
+
+    def _on_logs_closed(self, _result):
+        self._logs_dialog = None
 
     def _apply_settings(self, cfg):
         self.cfg = cfg
         self.timer.setInterval(cfg["refresh_interval"] * 1000)
         self.notified_high = False
         self.notified_low = False
+        append_log(
+            "INFO",
+            "settings_saved",
+            (
+                f"设置已保存 refresh_interval={cfg['refresh_interval']}s "
+                f"color_threshold={cfg['color_threshold']:.2f}% "
+                f"notify_high={cfg['notify_high']:.2f} notify_low={cfg['notify_low']:.2f}"
+            ),
+        )
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -292,13 +355,26 @@ class GoldWidget(QWidget):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        menu.setStyleSheet("""
+        menu.setStyleSheet(
+            """
             QMenu {
-                background: #2b2b2b; color: #e0e0e0;
-                border: 1px solid #555; border-radius: 6px; padding: 4px;
+                background: #2b2b2b;
+                color: #e0e0e0;
+                border: 1px solid #555;
+                border-radius: 6px;
+                padding: 4px;
             }
-            QMenu::item:selected { background: #4a9eff; border-radius: 4px; }
-        """)
+            QMenu::item:selected {
+                background: #4a9eff;
+                border-radius: 4px;
+            }
+            """
+        )
+
+        action_logs = QAction("日志", self)
+        action_logs.triggered.connect(self._schedule_open_logs)
+        menu.addAction(action_logs)
+
         action_settings = QAction("设置", self)
         action_settings.triggered.connect(self._schedule_open_settings)
         menu.addAction(action_settings)
@@ -308,6 +384,7 @@ class GoldWidget(QWidget):
         menu.addAction(action_refresh)
 
         menu.addSeparator()
+
         action_quit = QAction("退出", self)
         action_quit.triggered.connect(QApplication.quit)
         menu.addAction(action_quit)
