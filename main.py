@@ -153,38 +153,29 @@ class GoldWidget(QWidget):
 
         data = result["data"]
         price = data["price"]
-        prev = self.last_price
+        change = data["change"]
+        change_pct = data["change_pct"]
         self.last_price = price
 
         self.price_label.setText(f"¥{price:.2f}")
 
-        if prev is not None and prev > 0:
-            interval_pct = (price - prev) / prev * 100
-            arrow = "▲" if interval_pct >= 0 else "▼"
-            sign = "+" if interval_pct >= 0 else ""
-            self.change_label.setText(f"{arrow} {sign}{interval_pct:.2f}%")
+        sign = "+" if change >= 0 else ""
+        arrow = "▲" if change >= 0 else "▼"
+        self.change_label.setText(f"{arrow} {sign}{change_pct:.2f}%")
 
-            threshold = self.cfg["color_threshold"]
-            if interval_pct >= threshold:
-                color = "#ff4444"
-            elif interval_pct <= -threshold:
-                color = "#44ff44"
-            else:
-                color = "white"
-
-            self.price_label.setStyleSheet(f"color: {color};")
-            if color == "white":
-                self.change_label.setStyleSheet("color: rgba(255,255,255,0.5);")
-            else:
-                self.change_label.setStyleSheet(f"color: {color};")
+        threshold = self.cfg["color_threshold"]
+        if change_pct >= threshold:
+            color = "#ff4444"
+        elif change_pct <= -threshold:
+            color = "#44ff44"
         else:
-            change = data["change"]
-            change_pct = data["change_pct"]
-            sign = "+" if change >= 0 else ""
-            arrow = "▲" if change >= 0 else "▼"
-            self.change_label.setText(f"{arrow} {sign}{change_pct:.2f}%")
-            self.price_label.setStyleSheet("color: white;")
+            color = "white"
+
+        self.price_label.setStyleSheet(f"color: {color};")
+        if color == "white":
             self.change_label.setStyleSheet("color: rgba(255,255,255,0.5);")
+        else:
+            self.change_label.setStyleSheet(f"color: {color};")
 
         self.range_label.setText(f"低 {data['low']:.2f}  高 {data['high']:.2f}")
         append_log(
