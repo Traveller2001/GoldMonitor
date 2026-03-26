@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 import requests
@@ -12,6 +13,31 @@ SQ_GOLD_URL = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/in
 SQ_CNH_URL = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/USD/CNH"
 
 TROY_OZ_TO_GRAM = 31.1035
+
+# 缓存金交所昨收盘价，供休市时计算日涨跌
+_cached_pre_close = None  # type: Optional[float]
+
+# 金交所交易时段 (hour, minute)
+_TRADING_SESSIONS = [
+    ((9, 0), (11, 30)),
+    ((13, 30), (15, 30)),
+    ((20, 0), (23, 59)),
+]
+# 夜盘跨日：0:00 - 2:30
+_NIGHT_SESSION_END = (2, 30)
+
+
+def _is_trading_time():
+    # type: () -> bool
+    now = datetime.now()
+    t = (now.hour, now.minute)
+    # 夜盘跨日部分
+    if t <= _NIGHT_SESSION_END:
+        return True
+    for start, end in _TRADING_SESSIONS:
+        if start <= t <= end:
+            return True
+    return False
 
 
 def _sq_mid_price(url):
@@ -40,7 +66,17 @@ def _fetch_cmb():
         return {"ok": False, "error": f"cmb returned {data.get('returnCode')}"}
 
     for item in data.get("body", {}).get("data", []):
-        if item.get("goldNo") != "AUTD" or item.get("curPrice") == "0":
+        if item.get("goldNo") != "AUTD":
+            continue
+        # 无论是否休市，都缓存昨收盘价
+        try:
+            global _cached_pre_close
+            pre_close = float(item["preClose"])
+            if pre_close > 0:
+                _cached_pre_close = pre_close
+        except (KeyError, TypeError, ValueError):
+            pass
+        if item.get("curPrice") == "0":
             continue
         try:
             price = float(item["curPrice"])
@@ -75,12 +111,20 @@ def _fetch_swissquote():
             return {"ok": False, "error": "swissquote returned empty data"}
 
         rmb_gram = round(usd_oz * usd_cnh / TROY_OZ_TO_GRAM, 2)
+
+        # 用缓存的昨收盘价计算日涨跌
+        change = 0.0
+        change_pct = 0.0
+        if _cached_pre_close and _cached_pre_close > 0:
+            change = round(rmb_gram - _cached_pre_close, 2)
+            change_pct = round(change / _cached_pre_close * 100, 2)
+
         return {
             "ok": True,
             "data": {
                 "price": rmb_gram,
-                "change": 0.0,
-                "change_pct": 0.0,
+                "change": change,
+                "change_pct": change_pct,
                 "high": 0.0,
                 "low": 0.0,
                 "time": "",
@@ -93,11 +137,17 @@ def _fetch_swissquote():
 
 def fetch_gold_price_result():
     # type: () -> Dict[str, Any]
-    """混合数据源：优先招行金交所，休市自动切换国际金价"""
-    result = _fetch_cmb()
-    if result.get("ok"):
-        return result
-    # 金交所休市，切换到国际金价
+    """混合数据源：交易时段用招行金交所，休市自动切换国际金价"""
+    if _is_trading_time():
+        result = _fetch_cmb()
+        if result.get("ok"):
+            return result
+
+    # 休市：如果还没缓存昨收，先请求一次招行拿 preClose
+    global _cached_pre_close
+    if _cached_pre_close is None:
+        _fetch_cmb()  # 仅为触发缓存 preClose
+
     return _fetch_swissquote()
 
 

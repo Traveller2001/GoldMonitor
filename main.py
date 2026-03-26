@@ -177,15 +177,14 @@ class GoldWidget(QWidget):
 
         self.price_label.setText(f"¥{price:.2f}")
 
-        # 日涨跌（对比昨收）— 国际源无日涨跌数据
-        if source == "cmb":
-            change = data["change"]
-            change_pct = data["change_pct"]
+        # 日涨跌（对比昨收）
+        change = data["change"]
+        change_pct = data["change_pct"]
+        if change != 0 or change_pct != 0:
             sign = "+" if change >= 0 else ""
             arrow = "▲" if change >= 0 else "▼"
             self.daily_label.setText(f"日 {arrow}{sign}{change_pct:.2f}%")
 
-            # 日涨跌颜色：涨即红、跌即绿
             if change_pct > 0:
                 daily_color = "#ff4444"
             elif change_pct < 0:
