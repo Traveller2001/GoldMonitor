@@ -6,8 +6,8 @@ import time
 from collections import deque
 from typing import Optional
 
-from PyQt6.QtCore import QPoint, QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPainterPath, QPixmap
+from PyQt6.QtCore import QPoint, QPointF, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPixmap, QPolygonF
 from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget
 
 from api import fetch_gold_price_result
@@ -49,7 +49,7 @@ class GoldWidget(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow, True)
-        self.setFixedSize(200, 135)
+        self.setFixedSize(200, 190)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 10)
@@ -243,6 +243,7 @@ class GoldWidget(QWidget):
             f"抓取成功 source={source} price={price:.2f}",
         )
         self._check_notify(price)
+        self.update()  # 触发重绘曲线
 
     def _check_notify(self, price):
         high = self.cfg["notify_high"]
@@ -385,9 +386,88 @@ class GoldWidget(QWidget):
         path.addRoundedRect(0, 0, self.width(), self.height(), 16, 16)
         painter.setClipPath(path)
         painter.fillRect(self.rect(), QColor(30, 30, 30, 180))
+
+        # 绘制价格曲线
+        self._draw_sparkline(painter)
+
+        # 画边框（必须重置 brush，否则会被曲线颜色填充）
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QColor(255, 255, 255, 30))
         painter.drawPath(path)
         painter.end()
+
+    def _draw_sparkline(self, painter):
+        history = list(self._price_history)
+        if len(history) < 2:
+            return
+
+        # 曲线区域：底部 55px
+        chart_left = 12
+        chart_right = self.width() - 12
+        chart_top = self.height() - 60
+        chart_bottom = self.height() - 12
+        chart_w = chart_right - chart_left
+        chart_h = chart_bottom - chart_top
+
+        prices = [p for _, p in history]
+        p_min = min(prices)
+        p_max = max(prices)
+        p_range = p_max - p_min
+        if p_range < 0.01:
+            p_range = 1.0  # 价格几乎没变化时避免除零
+
+        t_min = history[0][0]
+        t_max = history[-1][0]
+        t_range = t_max - t_min
+        if t_range < 1:
+            return
+
+        # 构建曲线点
+        points = []
+        for ts, price in history:
+            x = chart_left + (ts - t_min) / t_range * chart_w
+            y = chart_bottom - (price - p_min) / p_range * chart_h
+            points.append(QPointF(x, y))
+
+        # 判断涨跌颜色：与区间涨跌逻辑一致
+        interval_min = self.cfg.get("interval_minutes", 5)
+        threshold = self.cfg["color_threshold"]
+        cutoff = t_max - interval_min * 60
+        ref_price = None
+        for ts, p in history:
+            if ts <= cutoff:
+                ref_price = p
+            else:
+                break
+
+        if ref_price is not None and ref_price > 0:
+            iv_pct = (prices[-1] - ref_price) / ref_price * 100
+            if iv_pct >= threshold:
+                line_color = QColor(255, 68, 68, 180)     # 红
+            elif iv_pct <= -threshold:
+                line_color = QColor(68, 255, 68, 180)     # 绿
+            else:
+                line_color = QColor(255, 255, 255, 120)   # 白
+        else:
+            line_color = QColor(255, 255, 255, 120)
+
+        # 画曲线
+        line_path = QPainterPath()
+        line_path.moveTo(points[0])
+        for pt in points[1:]:
+            line_path.lineTo(pt)
+
+        from PyQt6.QtGui import QPen
+        pen = QPen(line_color, 1.5)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(line_path)
+
+        # 最新价格点
+        from PyQt6.QtGui import QBrush
+        painter.setBrush(QBrush(line_color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(points[-1], 2.5, 2.5)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
