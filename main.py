@@ -27,13 +27,14 @@ class GoldWidget(QWidget):
         super().__init__()
         self.cfg = load_config()
         self.last_price = None  # type: Optional[float]
+        self._current_source = None  # type: Optional[str]
         self.notified_high = False
         self.notified_low = False
         self._drag_pos = None  # type: Optional[QPoint]
         self._fetcher = None  # type: Optional[PriceFetcher]
         self._settings_dialog = None  # type: Optional[SettingsDialog]
         self._logs_dialog = None  # type: Optional[LogsDialog]
-        self._price_history = deque(maxlen=1000)  # (timestamp, price)
+        self._price_history = deque(maxlen=1000)  # (timestamp, price, source)
 
         self._init_ui()
         self._init_tray()
@@ -167,7 +168,18 @@ class GoldWidget(QWidget):
         source = data.get("source", "cmb")
         self.last_price = price
         now = time.time()
-        self._price_history.append((now, price))
+
+        if self._current_source != source:
+            prev_source = self._current_source
+            self._current_source = source
+            self._price_history.clear()
+            self.interval_label.setText(f"{self.cfg.get('interval_minutes', 5)}min --")
+            self.interval_label.setStyleSheet("color: rgba(255,255,255,0.5);")
+            self.price_label.setStyleSheet("color: white;")
+            if prev_source is not None:
+                append_log("INFO", "source_switched", f"数据源切换 {prev_source} -> {source}")
+
+        self._price_history.append((now, price, source))
 
         # 标题：区分数据源
         if source == "intl":
@@ -200,7 +212,9 @@ class GoldWidget(QWidget):
         interval_min = self.cfg.get("interval_minutes", 5)
         cutoff = now - interval_min * 60
         ref_price = None
-        for ts, p in self._price_history:
+        for ts, p, hist_source in self._history_for_source(source):
+            if hist_source != source:
+                continue
             if ts <= cutoff:
                 ref_price = p
             else:
@@ -243,6 +257,9 @@ class GoldWidget(QWidget):
         )
         self._check_notify(price)
         self.update()  # 触发重绘曲线
+
+    def _history_for_source(self, source):
+        return [entry for entry in self._price_history if entry[2] == source]
 
     def _check_notify(self, price):
         high = self.cfg["notify_high"]
@@ -396,7 +413,7 @@ class GoldWidget(QWidget):
         painter.end()
 
     def _draw_sparkline(self, painter):
-        history = list(self._price_history)
+        history = self._history_for_source(self._current_source)
         if len(history) < 2:
             return
 
@@ -408,7 +425,7 @@ class GoldWidget(QWidget):
         chart_w = chart_right - chart_left
         chart_h = chart_bottom - chart_top
 
-        prices = [p for _, p in history]
+        prices = [p for _, p, _ in history]
         p_min = min(prices)
         p_max = max(prices)
         p_range = p_max - p_min
@@ -423,7 +440,7 @@ class GoldWidget(QWidget):
 
         # 构建曲线点
         points = []
-        for ts, price in history:
+        for ts, price, _ in history:
             x = chart_left + (ts - t_min) / t_range * chart_w
             y = chart_bottom - (price - p_min) / p_range * chart_h
             points.append(QPointF(x, y))
@@ -433,7 +450,7 @@ class GoldWidget(QWidget):
         threshold = self.cfg["color_threshold"]
         cutoff = t_max - interval_min * 60
         ref_price = None
-        for ts, p in history:
+        for ts, p, _ in history:
             if ts <= cutoff:
                 ref_price = p
             else:
