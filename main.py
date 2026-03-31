@@ -6,8 +6,8 @@ import time
 from collections import deque
 from typing import Optional
 
-from PyQt6.QtCore import QPoint, QPointF, QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPixmap, QPolygonF
+from PyQt6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRect, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget
 
 from api import fetch_gold_price_result
@@ -20,6 +20,29 @@ class PriceFetcher(QThread):
 
     def run(self):
         self.price_fetched.emit(fetch_gold_price_result())
+
+
+def _clamp(value, low, high):
+    # type: (int, int, int) -> int
+    if low > high:
+        return low
+    return max(low, min(value, high))
+
+
+def _blend_color(start, end, ratio):
+    # type: (QColor, QColor, float) -> QColor
+    ratio = max(0.0, min(1.0, ratio))
+    return QColor(
+        round(start.red() + (end.red() - start.red()) * ratio),
+        round(start.green() + (end.green() - start.green()) * ratio),
+        round(start.blue() + (end.blue() - start.blue()) * ratio),
+        round(start.alpha() + (end.alpha() - start.alpha()) * ratio),
+    )
+
+
+def _css_rgba(color):
+    # type: (QColor) -> str
+    return f"rgba({color.red()}, {color.green()}, {color.blue()}, {color.alpha()})"
 
 
 class GoldWidget(QWidget):
@@ -35,10 +58,31 @@ class GoldWidget(QWidget):
         self._settings_dialog = None  # type: Optional[SettingsDialog]
         self._logs_dialog = None  # type: Optional[LogsDialog]
         self._price_history = deque(maxlen=1000)  # (timestamp, price, source)
+        self._interval_change_pct = None  # type: Optional[float]
+        self._movement_theme = self._build_movement_theme(None)
+        self._dock_edge = None  # type: Optional[str]
+        self._dock_geo = None  # type: Optional[QRect]
+        self._dock_collapsed = False
+        self._drag_has_moved = False
+        self._peek_size = 24
+        self._snap_distance = 68
+        self._dock_hide_delay_ms = 420
+        self._dock_hotzone_thickness = 44
+        self._dock_hotzone_padding = 56
+        self._dock_animation = QPropertyAnimation(self, b"pos", self)
+        self._dock_animation.setDuration(180)
+        self._dock_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._dock_hide_timer = QTimer(self)
+        self._dock_hide_timer.setSingleShot(True)
+        self._dock_hide_timer.timeout.connect(self._collapse_dock)
+        self._dock_hover_timer = QTimer(self)
+        self._dock_hover_timer.setInterval(90)
+        self._dock_hover_timer.timeout.connect(self._check_dock_hotzone)
 
         self._init_ui()
         self._init_tray()
         self._init_timer()
+        self._dock_hover_timer.start()
         append_log("INFO", "app_start", "程序启动")
         self._fetch_price()
 
@@ -91,7 +135,7 @@ class GoldWidget(QWidget):
         screen = QApplication.primaryScreen()
         if screen:
             geo = screen.availableGeometry()
-            self.move(geo.width() - 220, 40)
+            self.move(geo.x() + geo.width() - 220, geo.y() + 40)
 
     def _init_tray(self):
         self.tray = QSystemTrayIcon(self)
@@ -155,6 +199,211 @@ class GoldWidget(QWidget):
         self._fetcher.price_fetched.connect(self._on_price)
         self._fetcher.start()
 
+    def _current_screen_geometry(self, global_point=None):
+        # type: (Optional[QPoint]) -> QRect
+        screen = QApplication.screenAt(global_point) if global_point is not None else None
+        if screen is None:
+            screen = QApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            screen = self.screen()
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return QRect(self.pos(), self.size())
+        return screen.availableGeometry()
+
+    def _clamp_pos_to_screen(self, pos, geo):
+        # type: (QPoint, QRect) -> QPoint
+        max_x = geo.x() + max(0, geo.width() - self.width())
+        max_y = geo.y() + max(0, geo.height() - self.height())
+        return QPoint(
+            _clamp(pos.x(), geo.x(), max_x),
+            _clamp(pos.y(), geo.y(), max_y),
+        )
+
+    def _detect_snap_edge(self, geo, global_point=None):
+        # type: (QRect, Optional[QPoint]) -> Optional[str]
+        frame = self.frameGeometry()
+        right_edge = geo.x() + geo.width()
+        bottom_edge = geo.y() + geo.height()
+        distances = {
+            "left": abs(frame.x() - geo.x()),
+            "right": abs(right_edge - (frame.x() + frame.width())),
+            "top": abs(frame.y() - geo.y()),
+            "bottom": abs(bottom_edge - (frame.y() + frame.height())),
+        }
+        if global_point is not None:
+            distances["left"] = min(distances["left"], abs(global_point.x() - geo.x()))
+            distances["right"] = min(distances["right"], abs(right_edge - global_point.x()))
+            distances["top"] = min(distances["top"], abs(global_point.y() - geo.y()))
+            distances["bottom"] = min(distances["bottom"], abs(bottom_edge - global_point.y()))
+        edge, distance = min(distances.items(), key=lambda item: item[1])
+        return edge if distance <= self._snap_distance else None
+
+    def _dock_target_pos(self, edge, collapsed):
+        # type: (str, bool) -> QPoint
+        geo = self._dock_geo or self._current_screen_geometry()
+        max_x = geo.x() + max(0, geo.width() - self.width())
+        max_y = geo.y() + max(0, geo.height() - self.height())
+
+        if edge == "left":
+            x = geo.x() - self.width() + self._peek_size if collapsed else geo.x()
+            y = _clamp(self.y(), geo.y(), max_y)
+            return QPoint(x, y)
+        if edge == "right":
+            x = geo.x() + geo.width() - self._peek_size if collapsed else geo.x() + geo.width() - self.width()
+            y = _clamp(self.y(), geo.y(), max_y)
+            return QPoint(x, y)
+        if edge == "top":
+            x = _clamp(self.x(), geo.x(), max_x)
+            y = geo.y() - self.height() + self._peek_size if collapsed else geo.y()
+            return QPoint(x, y)
+
+        x = _clamp(self.x(), geo.x(), max_x)
+        y = geo.y() + geo.height() - self._peek_size if collapsed else geo.y() + geo.height() - self.height()
+        return QPoint(x, y)
+
+    def _animate_to(self, target):
+        # type: (QPoint) -> None
+        self._dock_animation.stop()
+        if target == self.pos():
+            self.move(target)
+            return
+        self._dock_animation.setStartValue(self.pos())
+        self._dock_animation.setEndValue(target)
+        self._dock_animation.start()
+
+    def _set_dock_collapsed(self, collapsed, animate=True):
+        # type: (bool, bool) -> None
+        if not self._dock_edge:
+            return
+
+        self._dock_collapsed = collapsed
+        target = self._dock_target_pos(self._dock_edge, collapsed)
+        if animate:
+            self._animate_to(target)
+        else:
+            self._dock_animation.stop()
+            self.move(target)
+
+    def _clear_dock_state(self):
+        self._dock_hide_timer.stop()
+        self._dock_animation.stop()
+        self._dock_edge = None
+        self._dock_geo = None
+        self._dock_collapsed = False
+
+    def _is_cursor_inside(self):
+        # type: () -> bool
+        if not self.isVisible():
+            return False
+        return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+
+    def _schedule_dock_hide(self):
+        if self._dock_edge and self._drag_pos is None:
+            self._dock_hide_timer.start(self._dock_hide_delay_ms)
+
+    def _collapse_dock(self):
+        if not self._dock_edge or self._drag_pos is not None or self._is_cursor_inside():
+            return
+        self._set_dock_collapsed(True, animate=True)
+
+    def _dock_hotzone_rect(self):
+        # type: () -> QRect
+        if not self._dock_edge or self._dock_geo is None:
+            return QRect()
+
+        geo = self._dock_geo
+        frame = self.frameGeometry()
+        pad = self._dock_hotzone_padding
+        thickness = self._dock_hotzone_thickness
+        right_edge = geo.x() + geo.width()
+        bottom_edge = geo.y() + geo.height()
+
+        if self._dock_edge in ("left", "right"):
+            top = max(geo.y(), frame.y() - pad)
+            bottom = min(bottom_edge, frame.y() + frame.height() + pad)
+            height = max(1, bottom - top)
+            x = geo.x() if self._dock_edge == "left" else right_edge - thickness
+            return QRect(x, top, thickness, height)
+
+        left = max(geo.x(), frame.x() - pad)
+        right = min(right_edge, frame.x() + frame.width() + pad)
+        width = max(1, right - left)
+        y = geo.y() if self._dock_edge == "top" else bottom_edge - thickness
+        return QRect(left, y, width, thickness)
+
+    def _is_cursor_in_dock_hotzone(self):
+        # type: () -> bool
+        if not self.isVisible():
+            return False
+        return self._dock_hotzone_rect().contains(QCursor.pos())
+
+    def _check_dock_hotzone(self):
+        # type: () -> None
+        if not self._dock_edge or self._drag_pos is not None:
+            return
+
+        cursor_in_hotzone = self._is_cursor_in_dock_hotzone()
+        cursor_inside = self._is_cursor_inside()
+
+        if self._dock_collapsed:
+            if cursor_in_hotzone:
+                self._dock_hide_timer.stop()
+                self._set_dock_collapsed(False, animate=True)
+            return
+
+        if cursor_inside or cursor_in_hotzone:
+            self._dock_hide_timer.stop()
+        elif not self._dock_hide_timer.isActive():
+            self._schedule_dock_hide()
+
+    def _build_movement_theme(self, interval_pct):
+        # type: (Optional[float]) -> dict
+        neutral = {
+            "price": QColor(255, 255, 255),
+            "interval": QColor(255, 255, 255, 128),
+            "sparkline": QColor(255, 255, 255, 128),
+            "background": QColor(255, 255, 255, 0),
+            "border": QColor(255, 255, 255, 30),
+        }
+        if interval_pct is None:
+            return neutral
+
+        threshold = max(float(self.cfg.get("color_threshold", 0.5)), 0.01)
+        magnitude = abs(interval_pct)
+        if magnitude < threshold:
+            softness = magnitude / threshold
+            neutral["sparkline"] = QColor(255, 255, 255, 128 + round(softness * 24))
+            neutral["background"] = QColor(255, 255, 255, round(softness * 10))
+            neutral["border"] = QColor(255, 255, 255, 30 + round(softness * 8))
+            return neutral
+
+        ratio = min((magnitude - threshold) / (threshold * 2), 1.0)
+        if interval_pct > 0:
+            base = QColor(255, 150, 95)
+            peak = QColor(255, 68, 68)
+        else:
+            base = QColor(102, 225, 155)
+            peak = QColor(54, 210, 110)
+
+        accent = _blend_color(base, peak, ratio)
+        return {
+            "price": accent,
+            "interval": accent,
+            "sparkline": QColor(accent.red(), accent.green(), accent.blue(), 160 + round(ratio * 60)),
+            "background": QColor(accent.red(), accent.green(), accent.blue(), 28 + round(ratio * 56)),
+            "border": QColor(accent.red(), accent.green(), accent.blue(), 48 + round(ratio * 56)),
+        }
+
+    def _apply_movement_theme(self, interval_pct):
+        # type: (Optional[float]) -> None
+        self._interval_change_pct = interval_pct
+        self._movement_theme = self._build_movement_theme(interval_pct)
+        self.price_label.setStyleSheet(f"color: {self._movement_theme['price'].name()};")
+        self.interval_label.setStyleSheet(f"color: {_css_rgba(self._movement_theme['interval'])};")
+        self.update()
+
     def _on_price(self, result):
         if not isinstance(result, dict) or not result.get("ok"):
             error = "unknown error"
@@ -174,8 +423,7 @@ class GoldWidget(QWidget):
             self._current_source = source
             self._price_history.clear()
             self.interval_label.setText(f"{self.cfg.get('interval_minutes', 5)}min --")
-            self.interval_label.setStyleSheet("color: rgba(255,255,255,0.5);")
-            self.price_label.setStyleSheet("color: white;")
+            self._apply_movement_theme(None)
             if prev_source is not None:
                 append_log("INFO", "source_switched", f"数据源切换 {prev_source} -> {source}")
 
@@ -225,25 +473,10 @@ class GoldWidget(QWidget):
             iv_sign = "+" if iv_pct >= 0 else ""
             iv_arrow = "▲" if iv_pct >= 0 else "▼"
             self.interval_label.setText(f"{interval_min}min {iv_arrow}{iv_sign}{iv_pct:.2f}%")
-
-            threshold = self.cfg["color_threshold"]
-            if iv_pct >= threshold:
-                iv_color = "#ff4444"
-            elif iv_pct <= -threshold:
-                iv_color = "#44ff44"
-            else:
-                iv_color = "white"
-
-            # 价格主色由区间涨跌驱动
-            self.price_label.setStyleSheet(f"color: {iv_color};")
-            if iv_color == "white":
-                self.interval_label.setStyleSheet("color: rgba(255,255,255,0.5);")
-            else:
-                self.interval_label.setStyleSheet(f"color: {iv_color};")
+            self._apply_movement_theme(iv_pct)
         else:
             self.interval_label.setText(f"{interval_min}min --")
-            self.interval_label.setStyleSheet("color: rgba(255,255,255,0.5);")
-            self.price_label.setStyleSheet("color: white;")
+            self._apply_movement_theme(None)
 
         # 高低区间（国际源无此数据）
         if source == "cmb" and data["high"] > 0:
@@ -335,6 +568,9 @@ class GoldWidget(QWidget):
         return False
 
     def _show_widget(self):
+        if self._dock_edge:
+            self._dock_hide_timer.stop()
+            self._set_dock_collapsed(False, animate=False)
         self.show()
         self.raise_()
         self.activateWindow()
@@ -385,6 +621,7 @@ class GoldWidget(QWidget):
         self.timer.setInterval(cfg["refresh_interval"] * 1000)
         self.notified_high = False
         self.notified_low = False
+        self._apply_movement_theme(self._interval_change_pct)
         append_log(
             "INFO",
             "settings_saved",
@@ -401,14 +638,27 @@ class GoldWidget(QWidget):
         path = QPainterPath()
         path.addRoundedRect(0, 0, self.width(), self.height(), 16, 16)
         painter.setClipPath(path)
-        painter.fillRect(self.rect(), QColor(30, 30, 30, 180))
+        painter.fillRect(self.rect(), QColor(28, 30, 34, 208))
+
+        glow = self._movement_theme["background"]
+        if glow.alpha() > 0:
+            gradient = QLinearGradient(0, 0, self.width(), self.height())
+            gradient.setColorAt(0.0, QColor(glow.red(), glow.green(), glow.blue(), min(255, glow.alpha() + 18)))
+            gradient.setColorAt(0.65, glow)
+            gradient.setColorAt(1.0, QColor(glow.red(), glow.green(), glow.blue(), 0))
+            painter.fillRect(self.rect(), gradient)
+
+        top_glow = QLinearGradient(0, 0, 0, 70)
+        top_glow.setColorAt(0, QColor(255, 255, 255, 18))
+        top_glow.setColorAt(1, QColor(255, 255, 255, 0))
+        painter.fillRect(0, 0, self.width(), 70, top_glow)
 
         # 绘制价格曲线
         self._draw_sparkline(painter)
 
         # 画边框（必须重置 brush，否则会被曲线颜色填充）
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QColor(255, 255, 255, 30))
+        painter.setPen(self._movement_theme["border"])
         painter.drawPath(path)
         painter.end()
 
@@ -445,27 +695,7 @@ class GoldWidget(QWidget):
             y = chart_bottom - (price - p_min) / p_range * chart_h
             points.append(QPointF(x, y))
 
-        # 判断涨跌颜色：与区间涨跌逻辑一致
-        interval_min = self.cfg.get("interval_minutes", 5)
-        threshold = self.cfg["color_threshold"]
-        cutoff = t_max - interval_min * 60
-        ref_price = None
-        for ts, p, _ in history:
-            if ts <= cutoff:
-                ref_price = p
-            else:
-                break
-
-        if ref_price is not None and ref_price > 0:
-            iv_pct = (prices[-1] - ref_price) / ref_price * 100
-            if iv_pct >= threshold:
-                line_color = QColor(255, 68, 68, 180)     # 红
-            elif iv_pct <= -threshold:
-                line_color = QColor(68, 255, 68, 180)     # 绿
-            else:
-                line_color = QColor(255, 255, 255, 120)   # 白
-        else:
-            line_color = QColor(255, 255, 255, 120)
+        line_color = self._movement_theme["sparkline"]
 
         # 画曲线
         line_path = QPainterPath()
@@ -487,16 +717,53 @@ class GoldWidget(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            self._dock_hide_timer.stop()
+            self._dock_animation.stop()
+            if self._dock_edge and self._dock_collapsed:
+                self._set_dock_collapsed(False, animate=False)
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._drag_has_moved = False
 
     def mouseMoveEvent(self, event):
-        if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
+        if self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            if self._dock_edge and not self._drag_has_moved:
+                self._clear_dock_state()
+            self._drag_has_moved = True
             self.move(event.globalPosition().toPoint() - self._drag_pos)
 
     def mouseReleaseEvent(self, event):
+        release_point = event.globalPosition().toPoint()
+        geo = self._current_screen_geometry(release_point)
+        if self._drag_has_moved:
+            edge = self._detect_snap_edge(geo, release_point)
+            if edge:
+                self._dock_edge = edge
+                self._dock_geo = geo
+                self._set_dock_collapsed(True, animate=True)
+            else:
+                self.move(self._clamp_pos_to_screen(self.pos(), geo))
+                self._clear_dock_state()
+        elif self._dock_edge and not self._is_cursor_inside():
+            self._schedule_dock_hide()
         self._drag_pos = None
+        self._drag_has_moved = False
+
+    def enterEvent(self, event):
+        self._dock_hide_timer.stop()
+        if self._dock_edge and self._dock_collapsed:
+            self._set_dock_collapsed(False, animate=True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self._dock_edge and self._drag_pos is None:
+            self._schedule_dock_hide()
+        super().leaveEvent(event)
 
     def contextMenuEvent(self, event):
+        self._dock_hide_timer.stop()
+        if self._dock_edge and self._dock_collapsed:
+            self._set_dock_collapsed(False, animate=False)
+
         menu = QMenu(self)
         menu.setStyleSheet(
             """
@@ -532,6 +799,8 @@ class GoldWidget(QWidget):
         action_quit.triggered.connect(QApplication.quit)
         menu.addAction(action_quit)
         menu.exec(event.globalPos())
+        if self._dock_edge and not self._is_cursor_inside():
+            self._schedule_dock_hide()
 
 
 def main():
