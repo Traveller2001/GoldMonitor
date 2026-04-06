@@ -15,11 +15,26 @@ from logs import LogsDialog, append_log
 from settings import SettingsDialog, load_config
 
 
+class ClickableLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+
 class PriceFetcher(QThread):
     price_fetched = pyqtSignal(object)
 
+    def __init__(self, force_source="auto"):
+        super().__init__()
+        self._force_source = force_source
+
     def run(self):
-        self.price_fetched.emit(fetch_gold_price_result())
+        self.price_fetched.emit(fetch_gold_price_result(self._force_source))
 
 
 def _clamp(value, low, high):
@@ -51,6 +66,7 @@ class GoldWidget(QWidget):
         self.cfg = load_config()
         self.last_price = None  # type: Optional[float]
         self._current_source = None  # type: Optional[str]
+        self._force_source = "auto"  # type: str  # "auto", "cmb", "intl"
         self.notified_high = False
         self.notified_low = False
         self._drag_pos = None  # type: Optional[QPoint]
@@ -100,10 +116,12 @@ class GoldWidget(QWidget):
         layout.setContentsMargins(16, 14, 16, 10)
         layout.setSpacing(1)
 
-        self.title_label = QLabel("Au(T+D)")
+        self.title_label = ClickableLabel("Au(T+D)")
         self.title_label.setFont(QFont("PingFang SC", 10))
         self.title_label.setStyleSheet("color: rgba(255,255,255,0.5);")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.title_label.clicked.connect(self._toggle_source)
         layout.addWidget(self.title_label)
 
         self.price_label = QLabel("--")
@@ -195,7 +213,7 @@ class GoldWidget(QWidget):
     def _fetch_price(self):
         if self._fetcher and self._fetcher.isRunning():
             return
-        self._fetcher = PriceFetcher()
+        self._fetcher = PriceFetcher(self._force_source)
         self._fetcher.price_fetched.connect(self._on_price)
         self._fetcher.start()
 
@@ -404,6 +422,25 @@ class GoldWidget(QWidget):
         self.interval_label.setStyleSheet(f"color: {_css_rgba(self._movement_theme['interval'])};")
         self.update()
 
+    def _toggle_source(self):
+        if self._force_source == "intl" or (self._force_source == "auto" and self._current_source == "intl"):
+            self._set_source("cmb")
+        else:
+            self._set_source("intl")
+
+    def _set_source(self, source):
+        # type: (str) -> None
+        if self._force_source == source:
+            return
+        self._force_source = source
+        if source == "cmb":
+            self.title_label.setText("Au(T+D)")
+        elif source == "intl":
+            self.title_label.setText("XAU 国际金价")
+        append_log("INFO", "source_manual", f"手动切换数据源: {source}")
+        self._fetch_price()
+        QTimer.singleShot(2000, self._fetch_price)
+
     def _on_price(self, result):
         if not isinstance(result, dict) or not result.get("ok"):
             error = "unknown error"
@@ -421,9 +458,6 @@ class GoldWidget(QWidget):
         if self._current_source != source:
             prev_source = self._current_source
             self._current_source = source
-            self._price_history.clear()
-            self.interval_label.setText(f"{self.cfg.get('interval_minutes', 5)}min --")
-            self._apply_movement_theme(None)
             if prev_source is not None:
                 append_log("INFO", "source_switched", f"数据源切换 {prev_source} -> {source}")
 
@@ -460,15 +494,18 @@ class GoldWidget(QWidget):
         interval_min = self.cfg.get("interval_minutes", 5)
         cutoff = now - interval_min * 60
         ref_price = None
+        ref_ts = 0.0
         for ts, p, hist_source in self._history_for_source(source):
             if hist_source != source:
                 continue
             if ts <= cutoff:
                 ref_price = p
+                ref_ts = ts
             else:
                 break
 
-        if ref_price is not None and ref_price > 0:
+        # 防止使用过期参考价（如切换回一个很久没更新的数据源）
+        if ref_price is not None and ref_price > 0 and (now - ref_ts) < interval_min * 60 * 3:
             iv_pct = (price - ref_price) / ref_price * 100
             iv_sign = "+" if iv_pct >= 0 else ""
             iv_arrow = "▲" if iv_pct >= 0 else "▼"
@@ -792,6 +829,15 @@ class GoldWidget(QWidget):
         action_refresh = QAction("刷新", self)
         action_refresh.triggered.connect(self._fetch_price)
         menu.addAction(action_refresh)
+
+        menu.addSeparator()
+
+        for key, label in [("auto", "自动"), ("cmb", "招行金交所"), ("intl", "国际金价")]:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(self._force_source == key)
+            action.triggered.connect(lambda checked, k=key: self._set_source(k))
+            menu.addAction(action)
 
         menu.addSeparator()
 

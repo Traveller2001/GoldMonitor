@@ -135,16 +135,25 @@ def _fetch_swissquote():
         return {"ok": False, "error": f"swissquote failed: {exc}"}
 
 
-def fetch_gold_price_result():
-    # type: () -> Dict[str, Any]
-    """混合数据源：交易时段用招行金交所，休市自动切换国际金价"""
+def fetch_gold_price_result(force_source="auto"):
+    # type: (str) -> Dict[str, Any]
+    """混合数据源：交易时段用招行金交所，休市自动切换国际金价。force_source 可指定 cmb/intl"""
+    global _cached_pre_close
+
+    if force_source == "cmb":
+        return _fetch_cmb()
+
+    if force_source == "intl":
+        if _cached_pre_close is None:
+            _fetch_cmb()
+        return _fetch_swissquote()
+
+    # auto mode
     if _is_trading_time():
         result = _fetch_cmb()
         if result.get("ok"):
             return result
 
-    # 休市：如果还没缓存昨收，先请求一次招行拿 preClose
-    global _cached_pre_close
     if _cached_pre_close is None:
         _fetch_cmb()  # 仅为触发缓存 preClose
 
