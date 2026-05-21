@@ -67,6 +67,7 @@ class GoldWidget(QWidget):
         self.last_price = None  # type: Optional[float]
         self._current_source = None  # type: Optional[str]
         self._force_source = "auto"  # type: str  # "auto", "cmb", "intl"
+        self._last_fallback_pair = None
         self.notified_high = False
         self.notified_low = False
         self._drag_pos = None  # type: Optional[QPoint]
@@ -452,8 +453,15 @@ class GoldWidget(QWidget):
         data = result["data"]
         price = data["price"]
         source = data.get("source", "cmb")
+        fallback_from = data.get("fallback_from")
         self.last_price = price
         now = time.time()
+
+        fallback_pair = (fallback_from, source) if fallback_from and fallback_from != source else None
+        if fallback_pair != self._last_fallback_pair:
+            if fallback_pair:
+                append_log("WARN", "source_fallback", f"数据源 {fallback_from} 不可用，自动切换到 {source}")
+            self._last_fallback_pair = fallback_pair
 
         if self._current_source != source:
             prev_source = self._current_source

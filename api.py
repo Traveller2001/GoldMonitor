@@ -135,29 +135,44 @@ def _fetch_swissquote():
         return {"ok": False, "error": f"swissquote failed: {exc}"}
 
 
+def _fetch_source(source):
+    # type: (str) -> Dict[str, Any]
+    if source == "cmb":
+        return _fetch_cmb()
+    if source == "intl":
+        if _cached_pre_close is None:
+            _fetch_cmb()  # 仅为触发缓存 preClose
+        return _fetch_swissquote()
+    return {"ok": False, "error": f"unknown source: {source}"}
+
+
+def _fetch_with_fallback(sources):
+    # type: (list[str]) -> Dict[str, Any]
+    errors = []
+    for source in sources:
+        result = _fetch_source(source)
+        if result.get("ok"):
+            data = result.get("data", {})
+            if errors:
+                data["fallback_from"] = sources[0]
+            return result
+        errors.append(f"{source}: {result.get('error', 'unknown error')}")
+    return {"ok": False, "error": "; ".join(errors)}
+
+
 def fetch_gold_price_result(force_source="auto"):
     # type: (str) -> Dict[str, Any]
-    """混合数据源：交易时段用招行金交所，休市自动切换国际金价。force_source 可指定 cmb/intl"""
-    global _cached_pre_close
-
+    """混合数据源：优先使用指定来源，失败时自然切换到另一个来源。"""
     if force_source == "cmb":
-        return _fetch_cmb()
+        return _fetch_with_fallback(["cmb", "intl"])
 
     if force_source == "intl":
-        if _cached_pre_close is None:
-            _fetch_cmb()
-        return _fetch_swissquote()
+        return _fetch_with_fallback(["intl", "cmb"])
 
-    # auto mode
     if _is_trading_time():
-        result = _fetch_cmb()
-        if result.get("ok"):
-            return result
+        return _fetch_with_fallback(["cmb", "intl"])
 
-    if _cached_pre_close is None:
-        _fetch_cmb()  # 仅为触发缓存 preClose
-
-    return _fetch_swissquote()
+    return _fetch_with_fallback(["intl", "cmb"])
 
 
 def fetch_gold_price():
