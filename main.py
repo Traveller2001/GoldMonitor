@@ -10,31 +10,16 @@ from PyQt6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRec
 from PyQt6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget
 
-from api import fetch_gold_price_result
+from api import fetch_gold_price_result, seconds_until_next_market_transition
 from logs import LogsDialog, append_log
 from settings import SettingsDialog, load_config
-
-
-class ClickableLabel(QLabel):
-    clicked = pyqtSignal()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-            event.accept()
-        else:
-            super().mousePressEvent(event)
 
 
 class PriceFetcher(QThread):
     price_fetched = pyqtSignal(object)
 
-    def __init__(self, force_source="auto"):
-        super().__init__()
-        self._force_source = force_source
-
     def run(self):
-        self.price_fetched.emit(fetch_gold_price_result(self._force_source))
+        self.price_fetched.emit(fetch_gold_price_result())
 
 
 def _clamp(value, low, high):
@@ -66,12 +51,12 @@ class GoldWidget(QWidget):
         self.cfg = load_config()
         self.last_price = None  # type: Optional[float]
         self._current_source = None  # type: Optional[str]
-        self._force_source = "auto"  # type: str  # "auto", "cmb", "intl"
         self._last_fallback_pair = None
         self.notified_high = False
         self.notified_low = False
         self._drag_pos = None  # type: Optional[QPoint]
         self._fetcher = None  # type: Optional[PriceFetcher]
+        self._fetch_pending = False
         self._settings_dialog = None  # type: Optional[SettingsDialog]
         self._logs_dialog = None  # type: Optional[LogsDialog]
         self._price_history = deque(maxlen=1000)  # (timestamp, price, source)
@@ -117,12 +102,10 @@ class GoldWidget(QWidget):
         layout.setContentsMargins(16, 14, 16, 10)
         layout.setSpacing(1)
 
-        self.title_label = ClickableLabel("Au(T+D)")
+        self.title_label = QLabel("黄金实时价")
         self.title_label.setFont(QFont("PingFang SC", 10))
         self.title_label.setStyleSheet("color: rgba(255,255,255,0.5);")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.title_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.title_label.clicked.connect(self._toggle_source)
         layout.addWidget(self.title_label)
 
         self.price_label = QLabel("--")
@@ -211,12 +194,33 @@ class GoldWidget(QWidget):
         self.timer.timeout.connect(self._fetch_price)
         self.timer.start(self.cfg["refresh_interval"] * 1000)
 
+        self._source_transition_timer = QTimer(self)
+        self._source_transition_timer.setSingleShot(True)
+        self._source_transition_timer.timeout.connect(self._on_source_transition)
+        self._schedule_source_transition()
+
     def _fetch_price(self):
         if self._fetcher and self._fetcher.isRunning():
+            self._fetch_pending = True
             return
-        self._fetcher = PriceFetcher(self._force_source)
+        self._fetch_pending = False
+        self._fetcher = PriceFetcher()
         self._fetcher.price_fetched.connect(self._on_price)
+        self._fetcher.finished.connect(self._on_fetch_finished)
         self._fetcher.start()
+
+    def _on_fetch_finished(self):
+        if self._fetch_pending:
+            self._fetch_pending = False
+            QTimer.singleShot(0, self._fetch_price)
+
+    def _schedule_source_transition(self):
+        delay_seconds = seconds_until_next_market_transition()
+        self._source_transition_timer.start(max(1000, int(delay_seconds * 1000) + 250))
+
+    def _on_source_transition(self):
+        self._fetch_price()
+        self._schedule_source_transition()
 
     def _current_screen_geometry(self, global_point=None):
         # type: (Optional[QPoint]) -> QRect
@@ -423,25 +427,6 @@ class GoldWidget(QWidget):
         self.interval_label.setStyleSheet(f"color: {_css_rgba(self._movement_theme['interval'])};")
         self.update()
 
-    def _toggle_source(self):
-        if self._force_source == "intl" or (self._force_source == "auto" and self._current_source == "intl"):
-            self._set_source("cmb")
-        else:
-            self._set_source("intl")
-
-    def _set_source(self, source):
-        # type: (str) -> None
-        if self._force_source == source:
-            return
-        self._force_source = source
-        if source == "cmb":
-            self.title_label.setText("Au(T+D)")
-        elif source == "intl":
-            self.title_label.setText("XAU 国际金价")
-        append_log("INFO", "source_manual", f"手动切换数据源: {source}")
-        self._fetch_price()
-        QTimer.singleShot(2000, self._fetch_price)
-
     def _on_price(self, result):
         if not isinstance(result, dict) or not result.get("ok"):
             error = "unknown error"
@@ -470,12 +455,6 @@ class GoldWidget(QWidget):
                 append_log("INFO", "source_switched", f"数据源切换 {prev_source} -> {source}")
 
         self._price_history.append((now, price, source))
-
-        # 标题：区分数据源
-        if source == "intl":
-            self.title_label.setText("XAU 国际金价")
-        else:
-            self.title_label.setText("Au(T+D)")
 
         self.price_label.setText(f"¥{price:.2f}")
 
@@ -837,15 +816,6 @@ class GoldWidget(QWidget):
         action_refresh = QAction("刷新", self)
         action_refresh.triggered.connect(self._fetch_price)
         menu.addAction(action_refresh)
-
-        menu.addSeparator()
-
-        for key, label in [("auto", "自动"), ("cmb", "招行金交所"), ("intl", "国际金价")]:
-            action = QAction(label, self)
-            action.setCheckable(True)
-            action.setChecked(self._force_source == key)
-            action.triggered.connect(lambda checked, k=key: self._set_source(k))
-            menu.addAction(action)
 
         menu.addSeparator()
 
