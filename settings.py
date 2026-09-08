@@ -1,5 +1,7 @@
 import json
+import math
 import os
+import tempfile
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -25,28 +27,79 @@ DEFAULT_CONFIG = {
     "notify_low": 0.0,
 }
 
+_CONFIG_RANGES = {
+    "refresh_interval": (5, 300),
+    "color_threshold": (0.01, 10.0),
+    "interval_minutes": (1, 120),
+    "notify_high": (0.0, 99999.0),
+    "notify_low": (0.0, 99999.0),
+}
+
+
+def _normalize_config(cfg) -> dict:
+    """Keep persisted values safe for both the timers and Qt spin boxes."""
+    if not isinstance(cfg, dict):
+        cfg = {}
+    result = {}
+    for key, default in DEFAULT_CONFIG.items():
+        raw = cfg.get(key, default)
+        try:
+            if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+                raise ValueError("invalid numeric value")
+            value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError("non-finite numeric value")
+        except (ValueError, TypeError, OverflowError):
+            value = default
+        lower, upper = _CONFIG_RANGES[key]
+        value = max(lower, min(upper, value))
+        result[key] = int(value) if isinstance(default, int) else round(value, 2)
+    return result
+
+
+def _thresholds_conflict(cfg: dict) -> bool:
+    return cfg["notify_high"] > 0 and cfg["notify_low"] >= cfg["notify_high"]
+
 
 def load_config() -> dict:
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r") as f:
-                cfg = json.load(f)
-            return {**DEFAULT_CONFIG, **cfg}
-        except Exception:
-            pass
-    return dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = _normalize_config(json.load(f))
+    except (OSError, ValueError, UnicodeError):
+        return dict(DEFAULT_CONFIG)
+    if _thresholds_conflict(cfg):
+        # A hand-edited or old configuration must not trigger both alerts.
+        cfg["notify_high"] = cfg["notify_low"] = 0.0
+    return cfg
 
 
 def save_config(cfg: dict):
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
+    cfg = _normalize_config(cfg)
+    if _thresholds_conflict(cfg):
+        raise ValueError("高价通知阈值必须大于低价通知阈值。")
+    directory = os.path.dirname(os.path.abspath(CONFIG_PATH))
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory,
+            prefix=".goldmonitor-config-", suffix=".tmp", delete=False,
+        ) as f:
+            temporary_path = f.name
+            json.dump(cfg, f, indent=2, ensure_ascii=False, allow_nan=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, CONFIG_PATH)
+    finally:
+        if temporary_path is not None and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 class SettingsDialog(GlassDialog):
     settings_changed = pyqtSignal(dict)
 
     def __init__(self, parent=None):
-        super().__init__(parent, width=340, height=380)
+        super().__init__(parent, width=360, height=420)
         cfg = load_config()
 
         layout = QVBoxLayout(self)
@@ -107,6 +160,13 @@ class SettingsDialog(GlassDialog):
         form.addRow("", hint)
 
         layout.addLayout(form)
+        self.error_label = QLabel()
+        self.error_label.setWordWrap(True)
+        self.error_label.setStyleSheet(
+            "color: #ffb5b5; font-size: 11px; background: transparent;"
+        )
+        self.error_label.hide()
+        layout.addWidget(self.error_label)
         layout.addStretch()
 
         btn_layout = QHBoxLayout()
@@ -131,6 +191,13 @@ class SettingsDialog(GlassDialog):
             "notify_high": self.spin_high.value(),
             "notify_low": self.spin_low.value(),
         }
-        save_config(cfg)
+        try:
+            save_config(cfg)
+        except (OSError, ValueError) as exc:
+            self.error_label.setText(f"无法保存设置：{exc}")
+            self.error_label.show()
+            return
+        self.error_label.clear()
+        self.error_label.hide()
         self.settings_changed.emit(cfg)
         self.accept()

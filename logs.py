@@ -1,5 +1,9 @@
 import json
 import os
+import tempfile
+import threading
+import time
+from collections import deque
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -17,6 +21,12 @@ from glass import GlassDialog
 
 LOG_PATH = os.path.join(os.path.dirname(__file__), "goldmonitor.log.jsonl")
 RETENTION = timedelta(hours=1)
+MAX_ENTRIES = 2000
+MAX_LOG_BYTES = 2 * 1024 * 1024
+CLEANUP_INTERVAL_SECONDS = 60
+_LOG_LOCK = threading.RLock()
+_last_cleanup_path = None
+_last_cleanup_at = None
 
 
 def _now():
@@ -26,78 +36,148 @@ def _now():
 
 def _parse_ts(raw):
     # type: (Optional[str]) -> Optional[datetime]
-    if not raw:
+    if not isinstance(raw, str) or not raw:
         return None
     try:
-        return datetime.fromisoformat(raw)
-    except ValueError:
+        # Accept UTC suffixes on Python versions predating fromisoformat's Z support.
+        ts = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+        # Older log versions used local timestamps without an offset.
+        return ts.astimezone() if ts.tzinfo is None else ts
+    except (ValueError, TypeError, OverflowError, OSError):
         return None
+
+
+def _text(value, default, limit):
+    return value[:limit] if isinstance(value, str) else default
+
+
+def _encode_entry(entry):
+    return (json.dumps(entry, ensure_ascii=False, allow_nan=False) + "\n").encode(
+        "utf-8", errors="replace"
+    )
 
 
 def _prune_entries(entries):
     # type: (List[Dict]) -> List[Dict]
-    cutoff = _now() - RETENTION
-    kept = []
+    now = _now()
+    cutoff = now - RETENTION
+    kept = deque(maxlen=MAX_ENTRIES)
     for entry in entries:
-        ts = _parse_ts(entry.get("ts"))
-        if ts is None or ts < cutoff:
+        if not isinstance(entry, dict):
             continue
-        entry["ts"] = ts.isoformat(timespec="seconds")
-        kept.append(entry)
-    return kept
+        ts = _parse_ts(entry.get("ts"))
+        if ts is None or ts < cutoff or ts > now:
+            continue
+        kept.append({
+            "ts": ts.isoformat(timespec="seconds"),
+            "level": _text(entry.get("level"), "INFO", 32),
+            "event": _text(entry.get("event"), "event", 128),
+            "message": _text(entry.get("message"), "", 4000),
+        })
+    # Keep the newest complete records within the disk and memory budget.
+    bounded = []
+    size = 0
+    for entry in reversed(kept):
+        size += len(_encode_entry(entry))
+        if size > MAX_LOG_BYTES:
+            break
+        bounded.append(entry)
+    return list(reversed(bounded))
 
 
 def _read_entries():
     # type: () -> List[Dict]
-    if not os.path.exists(LOG_PATH):
-        return []
-    entries = []
-    try:
-        with open(LOG_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        return []
-    return entries
+    entries = deque(maxlen=MAX_ENTRIES)
+    with _LOG_LOCK:
+        try:
+            with open(LOG_PATH, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
+                if size > MAX_LOG_BYTES:
+                    f.seek(size - MAX_LOG_BYTES - 1)
+                    if f.read(1) != b"\n":
+                        f.readline()  # Discard the partial record at the start of the tail.
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                    except (ValueError, UnicodeError):
+                        continue
+                    if isinstance(entry, dict):
+                        entries.append(entry)
+        except OSError:
+            return []
+    return list(entries)
 
 
 def _write_entries(entries):
     # type: (List[Dict]) -> None
+    temporary_path = None
+    with _LOG_LOCK:
+        try:
+            directory = os.path.dirname(os.path.abspath(LOG_PATH))
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=directory, prefix=".goldmonitor-logs-", delete=False,
+            ) as f:
+                temporary_path = f.name
+                for entry in entries:
+                    f.write(_encode_entry(entry))
+            os.replace(temporary_path, LOG_PATH)
+        except OSError:
+            pass
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+
+
+def _log_size():
     try:
-        with open(LOG_PATH, "w", encoding="utf-8") as f:
-            for entry in entries:
-                json.dump(entry, f, ensure_ascii=False)
-                f.write("\n")
+        return os.path.getsize(LOG_PATH)
     except OSError:
-        pass
+        return 0
 
 
 def load_recent_logs():
     # type: () -> List[Dict]
-    entries = _read_entries()
-    pruned = _prune_entries(entries)
-    if os.path.exists(LOG_PATH) and len(pruned) != len(entries):
-        _write_entries(pruned)
-    return pruned
+    global _last_cleanup_path, _last_cleanup_at
+    with _LOG_LOCK:
+        entries = _read_entries()
+        pruned = _prune_entries(entries)
+        if pruned != entries or _log_size() > MAX_LOG_BYTES:
+            _write_entries(pruned)
+        _last_cleanup_path = os.path.abspath(LOG_PATH)
+        _last_cleanup_at = time.monotonic()
+        return pruned
 
 
 def append_log(level, event, message):
     # type: (str, str, str) -> None
     entry = {
         "ts": _now().isoformat(timespec="seconds"),
-        "level": level.upper(),
-        "event": event,
-        "message": message,
+        "level": _text(level, "INFO", 32).upper(),
+        "event": _text(event, "event", 128),
+        "message": _text(message, "", 4000),
     }
-    entries = load_recent_logs()
-    entries.append(entry)
-    _write_entries(entries)
+    with _LOG_LOCK:
+        if (
+            _last_cleanup_path != os.path.abspath(LOG_PATH)
+            or _last_cleanup_at is None
+            or time.monotonic() - _last_cleanup_at >= CLEANUP_INTERVAL_SECONDS
+            or _log_size() > MAX_LOG_BYTES
+        ):
+            load_recent_logs()
+        try:
+            with open(LOG_PATH, "a+b") as f:
+                # Recover gracefully from a partial last line after an interrupted write.
+                f.seek(0, os.SEEK_END)
+                if f.tell():
+                    f.seek(-1, os.SEEK_END)
+                    if f.read(1) != b"\n":
+                        f.write(b"\n")
+                f.write(_encode_entry(entry))
+        except OSError:
+            pass
 
 
 def format_logs(entries):
@@ -106,13 +186,18 @@ def format_logs(entries):
         return "最近 1 小时内暂无日志。"
     lines = []
     for entry in entries:
+        if not isinstance(entry, dict):
+            continue
         ts = _parse_ts(entry.get("ts"))
-        stamp = ts.astimezone().strftime("%H:%M:%S") if ts else "--:--:--"
+        try:
+            stamp = ts.astimezone().strftime("%H:%M:%S") if ts else "--:--:--"
+        except (ValueError, OverflowError, OSError):
+            stamp = "--:--:--"
         level = entry.get("level", "INFO")
         event = entry.get("event", "event")
         message = entry.get("message", "")
         lines.append(f"{stamp} [{level}] {event} {message}".rstrip())
-    return "\n".join(lines)
+    return "\n".join(lines) or "最近 1 小时内暂无日志。"
 
 
 class LogsDialog(GlassDialog):
@@ -166,7 +251,10 @@ class LogsDialog(GlassDialog):
         prev_v = vbar.value()
         was_at_bottom = prev_v >= max(0, vbar.maximum() - 4)
 
-        self.editor.setPlainText(format_logs(load_recent_logs()))
+        content = format_logs(load_recent_logs())
+        if content == self.editor.toPlainText():
+            return
+        self.editor.setPlainText(content)
 
         vbar = self.editor.verticalScrollBar()
         if was_at_bottom:

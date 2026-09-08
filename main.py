@@ -1,17 +1,16 @@
-import html
-import platform
-import subprocess
 import sys
 import time
-from collections import deque
 from typing import Optional
 
-from PyQt6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRect, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QEasingCurve, QPoint, QPropertyAnimation, QRect, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPixmap
-from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QMenu, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget
 
 from api import fetch_gold_price_result, seconds_until_next_market_transition
+from chart import Sparkline
 from logs import LogsDialog, append_log
+from notifications import NotificationDispatcher
+from price_history import PriceHistory
 from settings import SettingsDialog, load_config
 
 
@@ -19,7 +18,11 @@ class PriceFetcher(QThread):
     price_fetched = pyqtSignal(object)
 
     def run(self):
-        self.price_fetched.emit(fetch_gold_price_result())
+        try:
+            result = fetch_gold_price_result()
+        except Exception as exc:
+            result = {"ok": False, "error": f"行情请求异常: {exc}"}
+        self.price_fetched.emit(result)
 
 
 def _clamp(value, low, high):
@@ -59,7 +62,15 @@ class GoldWidget(QWidget):
         self._fetch_pending = False
         self._settings_dialog = None  # type: Optional[SettingsDialog]
         self._logs_dialog = None  # type: Optional[LogsDialog]
-        self._price_history = deque(maxlen=1000)  # (timestamp, price, source)
+        self._price_history = PriceHistory()
+        self._last_data = None
+        self._quote_timestamp = None
+        self._fetch_state = "loading"
+        self._fetch_error = ""
+        self._closing = False
+        self._notification_retry_at = {"high": 0.0, "low": 0.0}
+        self._notifier = NotificationDispatcher(self)
+        self._notifier.finished.connect(self._on_notification_finished)
         self._interval_change_pct = None  # type: Optional[float]
         self._movement_theme = self._build_movement_theme(None)
         self._dock_edge = None  # type: Optional[str]
@@ -84,7 +95,6 @@ class GoldWidget(QWidget):
         self._init_ui()
         self._init_tray()
         self._init_timer()
-        self._dock_hover_timer.start()
         append_log("INFO", "app_start", "程序启动")
         self._fetch_price()
 
@@ -96,48 +106,107 @@ class GoldWidget(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow, True)
-        self.setFixedSize(200, 190)
+        self.setWindowTitle("GoldMonitor · 黄金行情")
+        self.setFixedSize(188, 190)
+        self.setStyleSheet("QLabel { background: transparent; color: #eef0f4; }")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 10)
-        layout.setSpacing(1)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(2)
 
-        self.title_label = QLabel("黄金实时价")
-        self.title_label.setFont(QFont("PingFang SC", 10))
-        self.title_label.setStyleSheet("color: rgba(255,255,255,0.5);")
-        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.title_label)
+        header = QHBoxLayout()
+        header.setSpacing(5)
+        badge = QLabel("Au")
+        badge.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        badge.setFixedSize(21, 20)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setStyleSheet("color: #e4c98a; background: rgba(224,193,121,0.13); border-radius: 8px;")
+        header.addWidget(badge)
+        self.title_label = QLabel("黄金行情")
+        self.title_label.setFont(QFont("PingFang SC", 10, QFont.Weight.DemiBold))
+        header.addWidget(self.title_label)
+        header.addStretch()
+        self.refresh_button = self._tool_button("↻", "刷新行情", self._fetch_price)
+        header.addWidget(self.refresh_button)
+        header.addWidget(self._tool_button("⚙", "设置", self._schedule_open_settings))
+        layout.addLayout(header)
+
+        self.source_label = QLabel("自动选择交易中的数据源")
+        self.source_label.setFont(QFont("PingFang SC", 8))
+        self.source_label.setStyleSheet("color: #b0a48c;")
+        layout.addWidget(self.source_label)
+
+        price_row = QHBoxLayout()
+        price_row.setSpacing(2)
+        currency = QLabel("¥")
+        currency.setFont(QFont("Arial", 14))
+        currency.setStyleSheet("color: #a8abb3;")
+        price_row.addWidget(currency)
 
         self.price_label = QLabel("--")
-        self.price_label.setFont(QFont("Menlo", 26, QFont.Weight.Bold))
-        self.price_label.setStyleSheet("color: white;")
-        self.price_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.price_label)
+        self.price_label.setFont(QFont("Menlo", 21, QFont.Weight.Bold))
+        self.price_label.setAccessibleName("当前金价，人民币每克")
+        price_row.addWidget(self.price_label)
+        price_row.addStretch()
+        unit_label = QLabel("/ 克")
+        unit_label.setFont(QFont("PingFang SC", 8))
+        unit_label.setStyleSheet("color: #9297a2;")
+        unit_label.setToolTip("人民币 / 克")
+        price_row.addWidget(unit_label)
+        layout.addLayout(price_row)
 
-        # 日涨跌
-        self.daily_label = QLabel("")
-        self.daily_label.setFont(QFont("Menlo", 10))
-        self.daily_label.setStyleSheet("color: rgba(255,255,255,0.5);")
-        self.daily_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.daily_label)
+        metrics = QHBoxLayout()
+        metrics.setSpacing(8)
+        self.daily_label = QLabel("--")
+        self.interval_label = QLabel("--")
+        self.interval_title = QLabel(f"{self.cfg['interval_minutes']}分")
+        daily_title = QLabel("日")
+        daily_title.setToolTip("较昨收涨跌幅")
+        for title, value in ((daily_title, self.daily_label), (self.interval_title, self.interval_label)):
+            column = QHBoxLayout()
+            column.setSpacing(3)
+            title.setFont(QFont("PingFang SC", 8))
+            title.setStyleSheet("color: #9297a2;")
+            value.setFont(QFont("Menlo", 9, QFont.Weight.DemiBold))
+            column.addWidget(title)
+            column.addWidget(value)
+            column.addStretch()
+            metrics.addLayout(column, 1)
+        layout.addLayout(metrics)
 
-        # 区间涨跌
-        self.interval_label = QLabel("")
-        self.interval_label.setFont(QFont("Menlo", 10))
-        self.interval_label.setStyleSheet("color: rgba(255,255,255,0.5);")
-        self.interval_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.interval_label)
-
-        self.range_label = QLabel("")
-        self.range_label.setFont(QFont("PingFang SC", 9))
-        self.range_label.setStyleSheet("color: rgba(255,255,255,0.35);")
-        self.range_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.range_label = QLabel("日内低 / 高  --")
+        self.range_label.setFont(QFont("PingFang SC", 8))
+        self.range_label.setStyleSheet("color: #9297a2;")
         layout.addWidget(self.range_label)
+
+        self.chart = Sparkline(self)
+        layout.addWidget(self.chart)
+        self.status_label = QLabel("● 正在连接行情…")
+        self.status_label.setFont(QFont("PingFang SC", 8))
+        self.status_label.setStyleSheet("color: #b8a778;")
+        layout.addWidget(self.status_label)
+        self._apply_movement_theme(None)
 
         screen = QApplication.primaryScreen()
         if screen:
             geo = screen.availableGeometry()
-            self.move(geo.x() + geo.width() - 220, geo.y() + 40)
+            self.move(geo.x() + geo.width() - self.width() - 20, geo.y() + 40)
+
+    def _tool_button(self, text, tooltip, callback):
+        button = QToolButton(self)
+        button.setText(text)
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        button.setFixedSize(20, 20)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setStyleSheet("""
+            QToolButton { color: #a8abb3; background: transparent; border: none;
+                          border-radius: 6px; font-size: 14px; }
+            QToolButton:hover { color: #efd598; background: rgba(255,255,255,0.08); }
+            QToolButton:disabled { color: #545963; }
+        """)
+        button.clicked.connect(callback)
+        return button
 
     def _init_tray(self):
         self.tray = QSystemTrayIcon(self)
@@ -182,7 +251,7 @@ class GoldWidget(QWidget):
         menu.addSeparator()
 
         action_quit = QAction("退出", self)
-        action_quit.triggered.connect(QApplication.quit)
+        action_quit.triggered.connect(self._request_quit)
         menu.addAction(action_quit)
 
         self.tray_menu = menu
@@ -199,20 +268,69 @@ class GoldWidget(QWidget):
         self._source_transition_timer.timeout.connect(self._on_source_transition)
         self._schedule_source_transition()
 
+        self._status_timer = QTimer(self)
+        self._status_timer.timeout.connect(self._update_status)
+        self._status_timer.start(10000)
+
     def _fetch_price(self):
-        if self._fetcher and self._fetcher.isRunning():
+        if self._closing:
+            return
+        if self._fetcher is not None:
             self._fetch_pending = True
             return
         self._fetch_pending = False
-        self._fetcher = PriceFetcher()
+        self.refresh_button.setEnabled(False)
+        self._fetcher = PriceFetcher(self)
         self._fetcher.price_fetched.connect(self._on_price)
         self._fetcher.finished.connect(self._on_fetch_finished)
+        self._update_status()
         self._fetcher.start()
 
     def _on_fetch_finished(self):
+        fetcher = self._fetcher
+        self._fetcher = None
+        if fetcher is not None:
+            fetcher.deleteLater()
+        if self._closing:
+            QApplication.quit()
+            return
+        self.refresh_button.setEnabled(True)
+        self._update_status()
         if self._fetch_pending:
             self._fetch_pending = False
             QTimer.singleShot(0, self._fetch_price)
+
+    def _request_quit(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._fetch_pending = False
+        for timer in (self.timer, self._source_transition_timer, self._status_timer,
+                      self._dock_hover_timer, self._dock_hide_timer):
+            timer.stop()
+        self._dock_animation.stop()
+        self._notifier.shutdown()
+        self.tray.hide()
+        self.hide()
+        for dialog in (self._settings_dialog, self._logs_dialog):
+            if dialog is not None:
+                dialog.close()
+        # Allow the bounded request to finish before Qt destroys its thread.
+        if self._fetcher is None:
+            QApplication.quit()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self._request_quit()
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Quit:
+            if not self._closing:
+                self._request_quit()
+                return True
+            if self._fetcher is not None:
+                return True
+        return super().eventFilter(watched, event)
 
     def _schedule_source_transition(self):
         delay_seconds = seconds_until_next_market_transition()
@@ -302,6 +420,8 @@ class GoldWidget(QWidget):
             return
 
         self._dock_collapsed = collapsed
+        if self.isVisible():
+            self._dock_hover_timer.start()
         target = self._dock_target_pos(self._dock_edge, collapsed)
         if animate:
             self._animate_to(target)
@@ -311,6 +431,7 @@ class GoldWidget(QWidget):
 
     def _clear_dock_state(self):
         self._dock_hide_timer.stop()
+        self._dock_hover_timer.stop()
         self._dock_animation.stop()
         self._dock_edge = None
         self._dock_geo = None
@@ -327,7 +448,8 @@ class GoldWidget(QWidget):
             self._dock_hide_timer.start(self._dock_hide_delay_ms)
 
     def _collapse_dock(self):
-        if not self._dock_edge or self._drag_pos is not None or self._is_cursor_inside():
+        if (not self._dock_edge or self._drag_pos is not None or self._is_cursor_inside()
+                or QApplication.activePopupWidget() is not None):
             return
         self._set_dock_collapsed(True, animate=True)
 
@@ -364,7 +486,8 @@ class GoldWidget(QWidget):
 
     def _check_dock_hotzone(self):
         # type: () -> None
-        if not self._dock_edge or self._drag_pos is not None:
+        if (not self._dock_edge or self._drag_pos is not None
+                or QApplication.activePopupWidget() is not None):
             return
 
         cursor_in_hotzone = self._is_cursor_in_dock_hotzone()
@@ -385,8 +508,8 @@ class GoldWidget(QWidget):
         # type: (Optional[float]) -> dict
         neutral = {
             "price": QColor(255, 255, 255),
-            "interval": QColor(255, 255, 255, 128),
-            "sparkline": QColor(255, 255, 255, 128),
+            "interval": QColor(192, 196, 204),
+            "sparkline": QColor(215, 188, 125),
             "background": QColor(255, 255, 255, 0),
             "border": QColor(255, 255, 255, 30),
         }
@@ -428,19 +551,32 @@ class GoldWidget(QWidget):
         self.update()
 
     def _on_price(self, result):
+        if self._closing:
+            return
         if not isinstance(result, dict) or not result.get("ok"):
-            error = "unknown error"
-            if isinstance(result, dict):
-                error = result.get("error", error)
-            append_log("ERROR", "fetch_failed", f"抓取失败: {error}")
+            error = result.get("error", "unknown error") if isinstance(result, dict) else "invalid result"
+            state = "closed" if isinstance(result, dict) and result.get("status") == "closed" else "error"
+            if state != self._fetch_state or error != self._fetch_error:
+                append_log("INFO" if state == "closed" else "ERROR", "market_closed" if state == "closed" else "fetch_failed", str(error))
+            self._fetch_state = state
+            self._fetch_error = str(error)
+            self._apply_movement_theme(None)
+            self._update_status()
             return
 
         data = result["data"]
         price = data["price"]
         source = data.get("source", "cmb")
+        if self._price_history.is_outdated(source, data.get("quote_timestamp")):
+            self._on_price({"ok": False, "error": "数据源返回早于最近记录的报价，等待新报价"})
+            return
         fallback_from = data.get("fallback_from")
         self.last_price = price
-        now = time.time()
+        self._last_data = data
+        self._quote_timestamp = data.get("quote_timestamp", time.time())
+        self._fetch_state = "live"
+        self._fetch_error = ""
+        now = time.monotonic()
 
         fallback_pair = (fallback_from, source) if fallback_from and fallback_from != source else None
         if fallback_pair != self._last_fallback_pair:
@@ -454,142 +590,110 @@ class GoldWidget(QWidget):
             if prev_source is not None:
                 append_log("INFO", "source_switched", f"数据源切换 {prev_source} -> {source}")
 
-        self._price_history.append((now, price, source))
-
-        self.price_label.setText(f"¥{price:.2f}")
-
-        # 日涨跌（对比昨收）
-        change = data["change"]
-        change_pct = data["change_pct"]
-        if change != 0 or change_pct != 0:
-            sign = "+" if change >= 0 else ""
-            arrow = "▲" if change >= 0 else "▼"
-            self.daily_label.setText(f"日 {arrow}{sign}{change_pct:.2f}%")
-
-            if change_pct > 0:
-                daily_color = "#ff4444"
-            elif change_pct < 0:
-                daily_color = "#44ff44"
-            else:
-                daily_color = "rgba(255,255,255,0.5)"
-            self.daily_label.setStyleSheet(f"color: {daily_color};")
-        else:
-            self.daily_label.setText("日 --")
-            self.daily_label.setStyleSheet("color: rgba(255,255,255,0.3);")
-
-        # 区间涨跌（对比 N 分钟前）
-        interval_min = self.cfg.get("interval_minutes", 5)
-        cutoff = now - interval_min * 60
-        ref_price = None
-        ref_ts = 0.0
-        for ts, p, hist_source in self._history_for_source(source):
-            if hist_source != source:
-                continue
-            if ts <= cutoff:
-                ref_price = p
-                ref_ts = ts
-            else:
-                break
-
-        # 防止使用过期参考价（如切换回一个很久没更新的数据源）
-        if ref_price is not None and ref_price > 0 and (now - ref_ts) < interval_min * 60 * 3:
-            iv_pct = (price - ref_price) / ref_price * 100
-            iv_sign = "+" if iv_pct >= 0 else ""
-            iv_arrow = "▲" if iv_pct >= 0 else "▼"
-            self.interval_label.setText(f"{interval_min}min {iv_arrow}{iv_sign}{iv_pct:.2f}%")
-            self._apply_movement_theme(iv_pct)
-        else:
-            self.interval_label.setText(f"{interval_min}min --")
-            self._apply_movement_theme(None)
-
-        # 高低区间（国际源无此数据）
-        if source == "cmb" and data["high"] > 0:
-            self.range_label.setText(f"低 {data['low']:.2f}  高 {data['high']:.2f}")
-        else:
-            self.range_label.setText("")
-        append_log(
-            "INFO",
-            "fetch_success",
-            f"抓取成功 source={source} price={price:.2f}",
+        self._price_history.add(source, price, data.get("quote_timestamp"), now)
+        self.price_label.setText(f"{price:,.2f}")
+        self.source_label.setText("上海金交所 · Au(T+D)" if source == "cmb" else "国际现货 · 离岸人民币折算")
+        self.source_label.setToolTip(
+            "招商银行 Au(T+D) 行情，人民币/克" if source == "cmb" else
+            "Swissquote XAU/USD × USD/CNH ÷ 金衡盎司克数；与国内 Au(T+D) 属于不同市场。"
         )
-        self._check_notify(price)
-        self.update()  # 触发重绘曲线
 
-    def _history_for_source(self, source):
-        return [entry for entry in self._price_history if entry[2] == source]
+        change_pct = data.get("change_pct")
+        if change_pct is not None:
+            self.daily_label.setText(f"{change_pct:+.2f}%")
+            daily_color = "#ff8e84" if change_pct > 0 else "#77d7aa" if change_pct < 0 else "#b4bac5"
+            self.daily_label.setStyleSheet(f"color: {daily_color};")
+            self.daily_label.setToolTip("当前数据源相对昨收盘价的涨跌幅")
+        else:
+            self.daily_label.setText("--")
+            self.daily_label.setStyleSheet("color: #9297a2;")
+            self.daily_label.setToolTip("当前数据源未提供可比较的昨收价")
+
+        self._refresh_interval_view(now)
+        if source == "cmb" and data.get("high", 0) > 0 and data.get("low", 0) > 0:
+            self.range_label.setText(f"日内低 {data['low']:.2f}   高 {data['high']:.2f}")
+        else:
+            self.range_label.setText("日内低 / 高  --")
+        append_log("INFO", "fetch_success", f"抓取成功 source={source} price={price:.2f}")
+        self._check_notify(price)
+        self._update_status()
+
+    def _refresh_interval_view(self, now=None):
+        now = time.monotonic() if now is None else now
+        minutes = self.cfg["interval_minutes"]
+        self.interval_title.setText(f"{minutes}分")
+        self.interval_title.setToolTip(f"{minutes} 分钟涨跌幅")
+        change = None
+        if self.last_price is not None:
+            change = self._price_history.interval_change(
+                self._current_source, self.last_price, minutes * 60, self.cfg["refresh_interval"], now
+            )
+        self.interval_label.setText(f"{change:+.2f}%" if change is not None else "积累中")
+        self.interval_label.setToolTip("对比同一数据源的历史报价；数据不足或中断时不计算涨跌")
+        self._apply_movement_theme(change if self._fetch_state == "live" else None)
+        self.chart.set_series(
+            self._price_history.window(self._current_source, minutes * 60, now),
+            minutes * 60, self._movement_theme["sparkline"], self.cfg["refresh_interval"], now,
+        )
+        self.chart.setToolTip(f"最近 {minutes} 分钟 · 同一数据源 · 长时间断档以空隙显示")
+
+    def _update_status(self):
+        if self._closing:
+            return
+        stamp = time.strftime("%H:%M:%S", time.localtime(self._quote_timestamp)) if self._quote_timestamp else "--:--:--"
+        age = max(0, time.time() - self._quote_timestamp) if self._quote_timestamp else None
+        stale = age is not None and age > 180
+        if self._fetch_state == "closed":
+            text = "● 休市 · 保留最近报价" if self.last_price is not None else "● 休市 · 等待开盘"
+            color = "#a5a9b2"
+        elif self._fetch_state == "error":
+            text, color = "● 更新失败 · 等待重试", "#e9b479"
+        elif stale:
+            text, color = "● 报价已过期 · 等待更新", "#e9b479"
+        elif self._fetch_state == "loading":
+            text, color = "● 正在连接行情…", "#b8a778"
+        elif self._fetcher is not None:
+            text, color = "● 正在更新行情…", "#b8a778"
+        else:
+            text, color = f"● 实时 · 报价 {stamp}", "#99b5a7"
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color};")
+        detail = f"最近报价：{stamp}" if self._quote_timestamp else "尚无有效报价"
+        self.status_label.setToolTip(detail + (f"\n{self._fetch_error}" if self._fetch_error else ""))
+        self.price_label.setToolTip(detail)
+        self.tray.setToolTip(f"GoldMonitor · ¥{self.last_price:.2f}/克\n{text}" if self.last_price is not None else f"GoldMonitor\n{text}")
+        if self._fetch_state in ("closed", "error") or stale:
+            self.price_label.setStyleSheet("color: #a0a5af;")
+            self.interval_label.setText("--")
+            self.interval_label.setStyleSheet("color: #9297a2;")
+        else:
+            self.price_label.setStyleSheet(f"color: {self._movement_theme['price'].name()};")
 
     def _check_notify(self, price):
-        high = self.cfg["notify_high"]
-        low = self.cfg["notify_low"]
-
-        if high > 0 and price >= high and not self.notified_high:
-            self.notified_high = True
-            title = "金价突破高位"
-            body = f"¥{price:.2f}/g 已达到 >= ¥{high:.2f}"
-            if self._send_notification(title, body):
-                append_log("INFO", "notify_high", f"高价阈值触发 price={price:.2f} target={high:.2f}")
+        for kind, crossed in (("high", price >= self.cfg["notify_high"]), ("low", price <= self.cfg["notify_low"])):
+            target = self.cfg[f"notify_{kind}"]
+            if target <= 0 or not crossed:
+                setattr(self, f"notified_{kind}", False)
+                continue
+            if getattr(self, f"notified_{kind}") or time.monotonic() < self._notification_retry_at[kind]:
+                continue
+            title = "金价突破高位" if kind == "high" else "金价跌破低位"
+            operator = "≥" if kind == "high" else "≤"
+            body = f"¥{price:.2f}/g 已达到 {operator} ¥{target:.2f}"
+            if self._notifier.send(kind, title, body):
+                setattr(self, f"notified_{kind}", True)
             else:
-                append_log("WARN", "notify_high_failed", f"高价阈值触发但通知发送失败 price={price:.2f} target={high:.2f}")
-        elif high > 0 and price < high:
-            self.notified_high = False
+                self._notification_retry_at[kind] = time.monotonic() + 60
 
-        if low > 0 and price <= low and not self.notified_low:
-            self.notified_low = True
-            title = "金价跌破低位"
-            body = f"¥{price:.2f}/g 已达到 <= ¥{low:.2f}"
-            if self._send_notification(title, body):
-                append_log("INFO", "notify_low", f"低价阈值触发 price={price:.2f} target={low:.2f}")
-            else:
-                append_log("WARN", "notify_low_failed", f"低价阈值触发但通知发送失败 price={price:.2f} target={low:.2f}")
-        elif low > 0 and price > low:
-            self.notified_low = False
-
-    def _send_notification(self, title, body):
-        try:
-            if platform.system() == "Darwin":
-                result = subprocess.run(
-                    [
-                        "osascript",
-                        "-e",
-                        f'display notification "{body}" with title "{title}" sound name "Glass"',
-                    ],
-                    check=False,
-                    capture_output=True,
-                )
-                return result.returncode == 0
-
-            if platform.system() == "Linux":
-                result = subprocess.run(
-                    ["notify-send", title, body],
-                    check=False,
-                    capture_output=True,
-                )
-                return result.returncode == 0
-
-            if platform.system() == "Windows":
-                safe_title = html.escape(title, quote=True)
-                safe_body = html.escape(body, quote=True)
-                ps = (
-                    "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
-                    "ContentType = WindowsRuntime] > $null; "
-                    "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, "
-                    "ContentType = WindowsRuntime] > $null; "
-                    "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument; "
-                    f"$xml.LoadXml(\"<toast><visual><binding template='ToastGeneric'><text>{safe_title}</text>"
-                    f"<text>{safe_body}</text></binding></visual></toast>\"); "
-                    "$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
-                    "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('GoldMonitor').Show($toast)"
-                )
-                result = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", ps],
-                    check=False,
-                    capture_output=True,
-                )
-                return result.returncode == 0
-        except Exception:
-            return False
-
-        return False
+    def _on_notification_finished(self, kind, success):
+        if self._closing:
+            return
+        if success:
+            append_log("INFO", f"notify_{kind}", "价格阈值通知已发送")
+        else:
+            setattr(self, f"notified_{kind}", False)
+            self._notification_retry_at[kind] = time.monotonic() + 60
+            append_log("WARN", f"notify_{kind}_failed", "通知发送失败，60 秒后允许重试")
 
     def _show_widget(self):
         if self._dock_edge:
@@ -645,7 +749,9 @@ class GoldWidget(QWidget):
         self.timer.setInterval(cfg["refresh_interval"] * 1000)
         self.notified_high = False
         self.notified_low = False
-        self._apply_movement_theme(self._interval_change_pct)
+        self._notification_retry_at = {"high": 0.0, "low": 0.0}
+        self._refresh_interval_view()
+        self._update_status()
         append_log(
             "INFO",
             "settings_saved",
@@ -662,7 +768,7 @@ class GoldWidget(QWidget):
         path = QPainterPath()
         path.addRoundedRect(0, 0, self.width(), self.height(), 16, 16)
         painter.setClipPath(path)
-        painter.fillRect(self.rect(), QColor(28, 30, 34, 208))
+        painter.fillRect(self.rect(), QColor(25, 28, 34, 238))
 
         glow = self._movement_theme["background"]
         if glow.alpha() > 0:
@@ -677,67 +783,11 @@ class GoldWidget(QWidget):
         top_glow.setColorAt(1, QColor(255, 255, 255, 0))
         painter.fillRect(0, 0, self.width(), 70, top_glow)
 
-        # 绘制价格曲线
-        self._draw_sparkline(painter)
-
         # 画边框（必须重置 brush，否则会被曲线颜色填充）
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(self._movement_theme["border"])
         painter.drawPath(path)
         painter.end()
-
-    def _draw_sparkline(self, painter):
-        history = self._history_for_source(self._current_source)
-        if len(history) < 2:
-            return
-
-        # 曲线区域：底部 55px
-        chart_left = 12
-        chart_right = self.width() - 12
-        chart_top = self.height() - 60
-        chart_bottom = self.height() - 12
-        chart_w = chart_right - chart_left
-        chart_h = chart_bottom - chart_top
-
-        prices = [p for _, p, _ in history]
-        p_min = min(prices)
-        p_max = max(prices)
-        p_range = p_max - p_min
-        if p_range < 0.01:
-            p_range = 1.0  # 价格几乎没变化时避免除零
-
-        t_min = history[0][0]
-        t_max = history[-1][0]
-        t_range = t_max - t_min
-        if t_range < 1:
-            return
-
-        # 构建曲线点
-        points = []
-        for ts, price, _ in history:
-            x = chart_left + (ts - t_min) / t_range * chart_w
-            y = chart_bottom - (price - p_min) / p_range * chart_h
-            points.append(QPointF(x, y))
-
-        line_color = self._movement_theme["sparkline"]
-
-        # 画曲线
-        line_path = QPainterPath()
-        line_path.moveTo(points[0])
-        for pt in points[1:]:
-            line_path.lineTo(pt)
-
-        from PyQt6.QtGui import QPen
-        pen = QPen(line_color, 1.5)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawPath(line_path)
-
-        # 最新价格点
-        from PyQt6.QtGui import QBrush
-        painter.setBrush(QBrush(line_color))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(points[-1], 2.5, 2.5)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -783,46 +833,22 @@ class GoldWidget(QWidget):
             self._schedule_dock_hide()
         super().leaveEvent(event)
 
+    def hideEvent(self, event):
+        self._dock_hover_timer.stop()
+        self._dock_hide_timer.stop()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        if self._dock_edge:
+            self._dock_hover_timer.start()
+        super().showEvent(event)
+
     def contextMenuEvent(self, event):
         self._dock_hide_timer.stop()
         if self._dock_edge and self._dock_collapsed:
             self._set_dock_collapsed(False, animate=False)
 
-        menu = QMenu(self)
-        menu.setStyleSheet(
-            """
-            QMenu {
-                background: #2b2b2b;
-                color: #e0e0e0;
-                border: 1px solid #555;
-                border-radius: 6px;
-                padding: 4px;
-            }
-            QMenu::item:selected {
-                background: #4a9eff;
-                border-radius: 4px;
-            }
-            """
-        )
-
-        action_logs = QAction("日志", self)
-        action_logs.triggered.connect(self._schedule_open_logs)
-        menu.addAction(action_logs)
-
-        action_settings = QAction("设置", self)
-        action_settings.triggered.connect(self._schedule_open_settings)
-        menu.addAction(action_settings)
-
-        action_refresh = QAction("刷新", self)
-        action_refresh.triggered.connect(self._fetch_price)
-        menu.addAction(action_refresh)
-
-        menu.addSeparator()
-
-        action_quit = QAction("退出", self)
-        action_quit.triggered.connect(QApplication.quit)
-        menu.addAction(action_quit)
-        menu.exec(event.globalPos())
+        self.tray_menu.exec(event.globalPos())
         if self._dock_edge and not self._is_cursor_inside():
             self._schedule_dock_hide()
 
@@ -831,6 +857,7 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     widget = GoldWidget()
+    app.installEventFilter(widget)
     widget.show()
     sys.exit(app.exec())
 

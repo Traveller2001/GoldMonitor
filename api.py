@@ -1,3 +1,4 @@
+import math
 import time
 from datetime import date, datetime, time as clock_time, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -20,8 +21,6 @@ CMB_QUOTE_MAX_AGE_SECONDS = 180
 SWISSQUOTE_QUOTE_MAX_AGE_SECONDS = 180
 QUOTE_FUTURE_TOLERANCE_SECONDS = 10
 
-# 缓存金交所昨收盘价，供休市时计算日涨跌
-_cached_pre_close = None  # type: Optional[float]
 _source_unhealthy_until = {
     "cmb": 0.0,
     "intl": 0.0,
@@ -147,14 +146,42 @@ def _sq_quote(url):
     resp = requests.get(url, timeout=10, headers=HEADERS)
     resp.raise_for_status()
     data = resp.json()
-    if isinstance(data, list) and data:
-        profiles = data[0].get("spreadProfilePrices", [])
-        if profiles:
-            return {
-                "price": (profiles[0]["bid"] + profiles[0]["ask"]) / 2,
-                "timestamp": float(data[0]["ts"]),
-            }
-    return None
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return None
+    profiles = data[0].get("spreadProfilePrices")
+    if not isinstance(profiles, list) or not profiles or not isinstance(profiles[0], dict):
+        return None
+    bid = _finite_number(profiles[0].get("bid"), positive=True)
+    ask = _finite_number(profiles[0].get("ask"), positive=True)
+    timestamp = _epoch_timestamp(data[0].get("ts"))
+    if bid is None or ask is None or timestamp is None or bid > ask:
+        return None
+    return {
+        "price": bid + (ask - bid) / 2,
+        "timestamp": timestamp,
+    }
+
+
+def _finite_number(raw_value, positive=False):
+    # type: (Any, bool) -> Optional[float]
+    """外部数字必须有限；布尔值不能作为报价使用。"""
+    if isinstance(raw_value, bool):
+        return None
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(value) or (positive and value <= 0):
+        return None
+    return value
+
+
+def _epoch_timestamp(raw_timestamp):
+    # type: (Any) -> Optional[float]
+    timestamp = _finite_number(raw_timestamp, positive=True)
+    if timestamp is not None and timestamp > 10_000_000_000:
+        timestamp /= 1000.0
+    return timestamp
 
 
 def _cmb_quote_age_seconds(raw_time, now=None):
@@ -187,12 +214,9 @@ def _is_cmb_quote_fresh(raw_time, now=None):
 
 def _is_epoch_quote_fresh(raw_timestamp, now=None):
     # type: (Any, Optional[datetime]) -> bool
-    try:
-        quote_timestamp = float(raw_timestamp)
-    except (TypeError, ValueError):
+    quote_timestamp = _epoch_timestamp(raw_timestamp)
+    if quote_timestamp is None:
         return False
-    if quote_timestamp > 10_000_000_000:
-        quote_timestamp /= 1000.0
     current_timestamp = _market_now(now, _ZURICH_TZ).timestamp()
     age = current_timestamp - quote_timestamp
     return -QUOTE_FUTURE_TOLERANCE_SECONDS <= age <= SWISSQUOTE_QUOTE_MAX_AGE_SECONDS
@@ -208,51 +232,55 @@ def _fetch_cmb(now=None):
     except (requests.RequestException, ValueError) as exc:
         return {"ok": False, "error": f"cmb request failed: {exc}"}
 
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "cmb payload is not an object"}
     if data.get("returnCode") != "SUC0000":
         return {"ok": False, "error": f"cmb returned {data.get('returnCode')}"}
 
-    for item in data.get("body", {}).get("data", []):
-        if item.get("goldNo") != "AUTD":
+    body = data.get("body")
+    items = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        return {"ok": False, "error": "cmb payload has no quote list"}
+    for item in items:
+        if not isinstance(item, dict) or item.get("goldNo") != "AUTD":
             continue
-        # 无论是否休市，都缓存昨收盘价
-        try:
-            global _cached_pre_close
-            pre_close = float(item["preClose"])
-            if pre_close > 0:
-                _cached_pre_close = pre_close
-        except (KeyError, TypeError, ValueError):
-            pass
 
-        if not _is_cmb_trading_time(now):
+        current = _market_now(now, _SHANGHAI_TZ)
+        if not _is_cmb_trading_time(current):
             return {"ok": False, "error": "cmb market is outside trading hours"}
-        if not _is_cmb_quote_fresh(item.get("time"), now):
+        age = _cmb_quote_age_seconds(item.get("time"), current)
+        if age is None or not -QUOTE_FUTURE_TOLERANCE_SECONDS <= age <= CMB_QUOTE_MAX_AGE_SECONDS:
             return {
                 "ok": False,
                 "error": f"cmb quote is stale (time={item.get('time', '')})",
             }
-        try:
-            price = float(item["curPrice"])
-            if price <= 0:
-                continue
-            pre_close = float(item["preClose"])
-            change = float(item["upDown"])
-            change_pct = (change / pre_close * 100) if pre_close > 0 else 0
-            return {
-                "ok": True,
-                "data": {
-                    "price": price,
-                    "change": change,
-                    "change_pct": round(change_pct, 2),
-                    "high": float(item["high"]),
-                    "low": float(item["low"]),
-                    "time": item["time"],
-                    "source": "cmb",
-                },
-            }
-        except (KeyError, TypeError, ValueError) as exc:
-            return {"ok": False, "error": f"cmb payload error: {exc}"}
+        price = _finite_number(item.get("curPrice"), positive=True)
+        if price is None:
+            return {"ok": False, "error": "cmb current price is invalid"}
+        pre_close = _finite_number(item.get("preClose"), positive=True)
+        change = _finite_number(item.get("upDown"))
+        change_pct = None
+        if pre_close is not None and change is not None:
+            change_pct = _finite_number(change / pre_close * 100)
+        if change_pct is None:
+            change = None
+        else:
+            change_pct = round(change_pct, 2)
+        return {
+            "ok": True,
+            "data": {
+                "price": price,
+                "change": change,
+                "change_pct": change_pct,
+                "high": _finite_number(item.get("high"), positive=True) or 0.0,
+                "low": _finite_number(item.get("low"), positive=True) or 0.0,
+                "time": item["time"],
+                "quote_timestamp": current.timestamp() - age,
+                "source": "cmb",
+            },
+        }
 
-    return {"ok": False, "error": "AUTD price is 0 (market closed)"}
+    return {"ok": False, "error": "cmb returned no AUTD quote"}
 
 
 def _fetch_swissquote(now=None):
@@ -263,32 +291,38 @@ def _fetch_swissquote(now=None):
             return {"ok": False, "error": "swissquote market is outside trading hours"}
 
         gold_quote = _sq_quote(SQ_GOLD_URL)
+        if gold_quote is None:
+            return {"ok": False, "error": "swissquote XAU/USD returned empty or invalid data"}
         cnh_quote = _sq_quote(SQ_CNH_URL)
-        if gold_quote is None or cnh_quote is None:
-            return {"ok": False, "error": "swissquote returned empty data"}
-        if not _is_epoch_quote_fresh(gold_quote.get("timestamp"), now):
+        if cnh_quote is None:
+            return {"ok": False, "error": "swissquote USD/CNH returned empty or invalid data"}
+        # 两次请求都结束后用同一时刻校验，避免跨过收盘或报价有效期。
+        current = _market_now(now, _ZURICH_TZ)
+        if not _is_intl_trading_time(current):
+            return {"ok": False, "error": "swissquote market is outside trading hours"}
+        if not _is_epoch_quote_fresh(gold_quote.get("timestamp"), current):
             return {"ok": False, "error": "swissquote XAU/USD quote is stale"}
-        if not _is_epoch_quote_fresh(cnh_quote.get("timestamp"), now):
+        if not _is_epoch_quote_fresh(cnh_quote.get("timestamp"), current):
             return {"ok": False, "error": "swissquote USD/CNH quote is stale"}
 
-        rmb_gram = round(gold_quote["price"] * cnh_quote["price"] / TROY_OZ_TO_GRAM, 2)
-
-        # 用缓存的昨收盘价计算日涨跌
-        change = 0.0
-        change_pct = 0.0
-        if _cached_pre_close and _cached_pre_close > 0:
-            change = round(rmb_gram - _cached_pre_close, 2)
-            change_pct = round(change / _cached_pre_close * 100, 2)
+        rmb_gram = _finite_number(
+            round(gold_quote["price"] * cnh_quote["price"] / TROY_OZ_TO_GRAM, 2),
+            positive=True,
+        )
+        if rmb_gram is None:
+            return {"ok": False, "error": "swissquote converted price is invalid"}
 
         return {
             "ok": True,
             "data": {
                 "price": rmb_gram,
-                "change": change,
-                "change_pct": change_pct,
+                # 国际现货与 Au(T+D) 不是同一标的，不能借用其昨收计算日涨跌。
+                "change": None,
+                "change_pct": None,
                 "high": 0.0,
                 "low": 0.0,
                 "time": "",
+                "quote_timestamp": min(gold_quote["timestamp"], cnh_quote["timestamp"]),
                 "source": "intl",
             },
         }
@@ -301,8 +335,6 @@ def _fetch_source(source, now=None):
     if source == "cmb":
         return _fetch_cmb(now)
     if source == "intl":
-        if _cached_pre_close is None and _is_source_healthy("cmb"):
-            _fetch_cmb(now)  # 仅为触发缓存 preClose
         return _fetch_swissquote(now)
     return {"ok": False, "error": f"unknown source: {source}"}
 
@@ -359,7 +391,7 @@ def fetch_gold_price_result(force_source="auto", now=None):
         sources.insert(0, force_source)
 
     if not sources:
-        return {"ok": False, "error": "no live gold market is currently scheduled"}
+        return {"ok": False, "status": "closed", "error": "no live gold market is currently scheduled"}
 
     # 生产请求在网络响应后重新取当前时间，防止请求跨过收盘边界时接纳旧源；
     # 测试传入固定 now 时仍保持完全确定。
