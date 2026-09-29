@@ -37,19 +37,34 @@ class SettingsPersistenceTest(unittest.TestCase):
             "notify_low": -1,
         }), encoding="utf-8")
         self.assertEqual(settings.load_config(), {
+            **settings.DEFAULT_CONFIG,
             "refresh_interval": 5, "color_threshold": 10.0,
             "interval_minutes": 20, "notify_high": 99999.0,
             "notify_low": 0.0,
         })
 
     def test_invalid_types_and_nonfinite_values_use_defaults(self):
+        numeric = [key for key, spec in settings.SCHEMA.items() if spec[1] in ("int", "float")]
         for invalid in (True, None, [], {}, "invalid", float("inf"), float("nan")):
             with self.subTest(invalid=invalid):
-                self.path.write_text(
-                    json.dumps(dict.fromkeys(settings.DEFAULT_CONFIG, invalid)),
-                    encoding="utf-8",
-                )
+                self.path.write_text(json.dumps(dict.fromkeys(numeric, invalid)), encoding="utf-8")
                 self.assertEqual(settings.load_config(), settings.DEFAULT_CONFIG)
+
+    def test_switches_text_and_choices_are_validated(self):
+        self.path.write_text(json.dumps({
+            "outlook_enabled": 0, "macro_notify": "yes", "ai_enabled": [],
+            "deepseek_api_key": "  sk-abc  ", "deepseek_model": 5,
+            "ai_tag_effort": "off", "ai_deep_effort": "extreme", "ai_daily_token_budget": -5,
+        }), encoding="utf-8")
+        cfg = settings.load_config()
+        self.assertEqual((cfg["outlook_enabled"], cfg["macro_notify"], cfg["ai_enabled"]), (False, True, True))
+        self.assertEqual((cfg["deepseek_api_key"], cfg["deepseek_model"]), ("sk-abc", "deepseek-flash"))
+        self.assertEqual((cfg["ai_tag_effort"], cfg["ai_deep_effort"]), ("off", "high"))
+        self.assertEqual(cfg["ai_daily_token_budget"], 0)
+
+    def test_unknown_keys_from_older_versions_are_dropped(self):
+        self.path.write_text('{"refresh_interval": 60, "legacy": true}', encoding="utf-8")
+        self.assertNotIn("legacy", settings.load_config())
 
     def test_conflicting_persisted_alerts_are_disabled(self):
         self.path.write_text('{"notify_high": 700, "notify_low": 800}', encoding="utf-8")
@@ -108,6 +123,20 @@ class SettingsDialogTest(unittest.TestCase):
         self.assertEqual(self.saved[0]["refresh_interval"], 45)
         save.assert_called_once_with(self.saved[0])
         self.assertEqual(self.dialog.result(), 1)
+
+    def test_ai_options_are_saved_and_disabled_with_the_outlook(self):
+        self.dialog.edit_key.setText(" sk-new ")
+        self.dialog.combo_tag_effort.setCurrentIndex(settings.EFFORTS.index("low"))
+        self.dialog.spin_budget.setValue(200000)
+        with patch.object(settings, "save_config"):
+            self.dialog._save()
+        saved = self.saved[0]
+        self.assertEqual((saved["deepseek_api_key"], saved["ai_tag_effort"], saved["ai_deep_effort"]),
+                         ("sk-new", "low", "high"))
+        self.assertEqual(saved["ai_daily_token_budget"], 200000)
+        self.dialog.check_outlook.setChecked(False)
+        self.assertFalse(self.dialog.check_ai.isEnabled())
+        self.assertFalse(self.dialog.edit_key.isEnabled())
 
 
 if __name__ == "__main__":

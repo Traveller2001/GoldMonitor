@@ -144,7 +144,7 @@ class QuotePayloadTest(unittest.TestCase):
         }]
 
     def test_cmb_valid_quote_has_finite_prices_and_exchange_timestamp(self):
-        with patch.object(api.requests, "get", return_value=self.response(self.cmb_payload())):
+        with patch.object(api._session, "get", return_value=self.response(self.cmb_payload())):
             result = api._fetch_cmb(self.now)
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["price"], 750.5)
@@ -155,33 +155,33 @@ class QuotePayloadTest(unittest.TestCase):
         for payload in (None, [], "invalid", {}, {"returnCode": "SUC0000", "body": None},
                         {"returnCode": "SUC0000", "body": {"data": {}}}):
             with self.subTest(payload=payload):
-                with patch.object(api.requests, "get", return_value=self.response(payload)):
+                with patch.object(api._session, "get", return_value=self.response(payload)):
                     self.assertFalse(api._fetch_cmb(self.now)["ok"])
 
     def test_cmb_ignores_unrelated_malformed_rows(self):
         payload = self.cmb_payload()
         payload["body"]["data"].insert(0, None)
-        with patch.object(api.requests, "get", return_value=self.response(payload)):
+        with patch.object(api._session, "get", return_value=self.response(payload)):
             self.assertTrue(api._fetch_cmb(self.now)["ok"])
 
     def test_cmb_rejects_invalid_current_prices(self):
         for price in (None, True, {}, "NaN", "Infinity", float("-inf"), "0", "-2"):
             with self.subTest(price=price):
-                with patch.object(api.requests, "get", return_value=self.response(self.cmb_payload(curPrice=price))):
+                with patch.object(api._session, "get", return_value=self.response(self.cmb_payload(curPrice=price))):
                     self.assertFalse(api._fetch_cmb(self.now)["ok"])
 
     def test_cmb_missing_daily_reference_does_not_fabricate_zero_change(self):
         for fields in ({"preClose": "NaN"}, {"preClose": "0"}, {"upDown": None},
                        {"preClose": "1e-323", "upDown": "1000"}):
             with self.subTest(fields=fields):
-                with patch.object(api.requests, "get", return_value=self.response(self.cmb_payload(**fields))):
+                with patch.object(api._session, "get", return_value=self.response(self.cmb_payload(**fields))):
                     result = api._fetch_cmb(self.now)
                 self.assertTrue(result["ok"])
                 self.assertIsNone(result["data"]["change"])
                 self.assertIsNone(result["data"]["change_pct"])
 
     def test_swissquote_accepts_numeric_strings_and_normalizes_milliseconds(self):
-        with patch.object(api.requests, "get", return_value=self.response(self.sq_payload())):
+        with patch.object(api._session, "get", return_value=self.response(self.sq_payload())):
             quote = api._sq_quote(api.SQ_GOLD_URL)
         self.assertEqual(quote["price"], 2401.0)
         self.assertEqual(quote["timestamp"], self.now.timestamp())
@@ -193,7 +193,7 @@ class QuotePayloadTest(unittest.TestCase):
                     self.sq_payload(bid="2403", ask="2402"), self.sq_payload(timestamp="NaN")]
         for payload in payloads:
             with self.subTest(payload=payload):
-                with patch.object(api.requests, "get", return_value=self.response(payload)):
+                with patch.object(api._session, "get", return_value=self.response(payload)):
                     self.assertIsNone(api._sq_quote(api.SQ_GOLD_URL))
 
     def test_international_quote_never_fetches_or_uses_cmb_daily_baseline(self):
@@ -241,7 +241,7 @@ class QuotePayloadTest(unittest.TestCase):
                      self.response(self.sq_payload(bid="7.19", ask="7.21"))]
         with patch.dict(api._source_unhealthy_until, health, clear=True), \
                 patch.object(api, "_last_success_source", None), \
-                patch.object(api.requests, "get", side_effect=responses) as request:
+                patch.object(api._session, "get", side_effect=responses) as request:
             result = api.fetch_gold_price_result(now=self.now)
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["source"], "intl")

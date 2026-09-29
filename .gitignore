@@ -1,3 +1,6 @@
 __pycache__
 config.json
 goldmonitor.log.jsonl
+ai_cache.json
+.goldmonitor-*.tmp
+nohup.out

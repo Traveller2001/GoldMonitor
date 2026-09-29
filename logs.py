@@ -7,17 +7,10 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QFont
-from PyQt6.QtWidgets import (
-    QHBoxLayout,
-    QLabel,
-    QPlainTextEdit,
-    QPushButton,
-    QVBoxLayout,
-)
+from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import QHBoxLayout, QPlainTextEdit, QPushButton
 
-from glass import GlassDialog
+from glass import GlassDialog, hint_label
 
 LOG_PATH = os.path.join(os.path.dirname(__file__), "goldmonitor.log.jsonl")
 RETENTION = timedelta(hours=1)
@@ -202,43 +195,27 @@ def format_logs(entries):
 
 class LogsDialog(GlassDialog):
     def __init__(self, parent=None):
-        super().__init__(parent, width=580, height=400)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 18)
-        layout.setSpacing(10)
-
-        # 标题
-        title = QLabel("运行日志")
-        title.setFont(QFont("PingFang SC", 16, QFont.Weight.Bold))
-        title.setStyleSheet("color: white; background: transparent;")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
-
-        hint = QLabel("仅保留最近 1 小时")
-        hint.setStyleSheet("color: rgba(255,255,255,0.3); font-size: 11px; background: transparent;")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(hint)
+        super().__init__(parent, width=600, height=420, title="运行日志")
+        self.close_button.clicked.disconnect()
+        self.close_button.clicked.connect(self.close)
+        self.body.addWidget(hint_label("仅保留最近 1 小时，每 2 秒自动刷新"))
 
         self.editor = QPlainTextEdit(self)
         self.editor.setReadOnly(True)
         self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        layout.addWidget(self.editor)
+        self.body.addWidget(self.editor, 1)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
         btn_row.addStretch()
-
         btn_refresh = QPushButton("刷新")
+        btn_refresh.setObjectName("secondary")
         btn_refresh.clicked.connect(self.refresh_logs)
         btn_row.addWidget(btn_refresh)
-
         btn_close = QPushButton("关闭")
-        btn_close.setObjectName("closeBtn")
         btn_close.clicked.connect(self.close)
         btn_row.addWidget(btn_close)
-
-        layout.addLayout(btn_row)
+        self.body.addLayout(btn_row)
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh_logs)

@@ -7,6 +7,12 @@ from zoneinfo import ZoneInfo
 import requests
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+REQUEST_TIMEOUT = (4, 8)
+
+# One pooled session: quotes refresh every few seconds, so keep-alive saves a
+# TLS handshake per request. Fetches run on one worker thread at a time.
+_session = requests.Session()
+_session.headers.update(HEADERS)
 
 # 招行金交所接口
 CMB_URL = "https://m.cmbchina.com/api/rate/gold"
@@ -69,12 +75,6 @@ def _is_cmb_trading_time(now=None):
     return 1 <= weekday <= 5 and current_time < _CMB_NIGHT_END
 
 
-def _is_trading_time(now=None):
-    # type: (Optional[datetime]) -> bool
-    """兼容旧调用：交易时段特指招行 Au(T+D) 渠道。"""
-    return _is_cmb_trading_time(now)
-
-
 def _is_intl_trading_time(now=None):
     # type: (Optional[datetime]) -> bool
     current = _market_now(now, _ZURICH_TZ)
@@ -93,6 +93,12 @@ def _scheduled_sources(now=None):
     if _is_intl_trading_time(now):
         sources.append("intl")
     return sources
+
+
+def is_market_open(now=None):
+    # type: (Optional[datetime]) -> bool
+    """任一渠道处于交易时段；周末和每日休市时两边都关闭。"""
+    return bool(_scheduled_sources(now))
 
 
 def _combine_market_time(day, time_parts, tz):
@@ -143,7 +149,7 @@ def seconds_until_next_market_transition(now=None):
 
 def _sq_quote(url):
     # type: (str) -> Optional[Dict[str, float]]
-    resp = requests.get(url, timeout=10, headers=HEADERS)
+    resp = _session.get(url, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     data = resp.json()
     if not isinstance(data, list) or not data or not isinstance(data[0], dict):
@@ -226,7 +232,7 @@ def _fetch_cmb(now=None):
     # type: (Optional[datetime]) -> Dict[str, Any]
     """从招行获取 Au(T+D) 价格，休市时返回 ok=False"""
     try:
-        resp = requests.get(CMB_URL, timeout=10, headers=HEADERS)
+        resp = _session.get(CMB_URL, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
     except (requests.RequestException, ValueError) as exc:
@@ -381,15 +387,11 @@ def _fetch_with_fallback(sources, now=None):
     return {"ok": False, "error": "; ".join(errors)}
 
 
-def fetch_gold_price_result(force_source="auto", now=None):
-    # type: (str, Optional[datetime]) -> Dict[str, Any]
+def fetch_gold_price_result(now=None):
+    # type: (Optional[datetime]) -> Dict[str, Any]
     """按市场有效时间自动选源，并在首选报价失效时回退。"""
     current = _market_now(now, _SHANGHAI_TZ)
     sources = _scheduled_sources(current)
-    if force_source in ("cmb", "intl") and force_source in sources:
-        sources.remove(force_source)
-        sources.insert(0, force_source)
-
     if not sources:
         return {"ok": False, "status": "closed", "error": "no live gold market is currently scheduled"}
 
@@ -397,9 +399,3 @@ def fetch_gold_price_result(force_source="auto", now=None):
     # 测试传入固定 now 时仍保持完全确定。
     validation_now = current if now is not None else None
     return _fetch_with_fallback(sources, validation_now)
-
-
-def fetch_gold_price():
-    # type: () -> Optional[Dict[str, Any]]
-    result = fetch_gold_price_result()
-    return result.get("data") if result.get("ok") else None
